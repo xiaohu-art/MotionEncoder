@@ -7,7 +7,7 @@ from collections import deque
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-from model import VQVAE
+from model import AutoEncoder
 from dataset import VAEDataLoader
 
 def animate_3d_comparison(joints_orig, joints_recon, title=""):
@@ -41,24 +41,24 @@ def animate_3d_comparison(joints_orig, joints_recon, title=""):
     ax.quiver(0, 0, 0, 0, 0, 1, color='b', length=0.1)
 
     num_frames = joints_orig.shape[0]
-    ani = animation.FuncAnimation(fig, update, frames=num_frames, interval=33, blit=False) 
-    plt.show()
+    ani = animation.FuncAnimation(fig, update, frames=num_frames, interval=33, blit=False)
+    ani.save(f"ae_sfu.mp4", writer='ffmpeg', fps=30)
+    # plt.show()
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     SEQ_LEN = 150
     LATENT_DIM = 256
-    CODEBOOK_SIZE = 256
     DATA_PATH = "data/sfu_scaled.pkl"
-    BEST_MODEL_PATH = "checkpoints/vqvae_best_model.pth"
+    BEST_MODEL_PATH = "checkpoints/ae_best_model.pth"
 
     temp_dataset = VAEDataLoader(data={}, keys_to_use=[], seq_len=1)
     DATA_DIM = temp_dataset.data_dim
     
     print("Loading original model...")
-    model = VQVAE(
-        data_dim=DATA_DIM, latent_dim=LATENT_DIM, codebook_size=CODEBOOK_SIZE
+    model = AutoEncoder(
+        data_dim=DATA_DIM, latent_dim=LATENT_DIM
     ).to(device)
     checkpoint = torch.load(BEST_MODEL_PATH, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -89,7 +89,7 @@ if __name__ == "__main__":
         current_context_tensor = torch.stack(list(context_queue), dim=0).unsqueeze(0)
         
         with torch.no_grad():
-            reconstructed_context, _, _ = model(current_context_tensor)
+            reconstructed_context = model(current_context_tensor)
             current_recon_frame = reconstructed_context[:, -1, :]
         
         reconstructions.append(current_recon_frame)
