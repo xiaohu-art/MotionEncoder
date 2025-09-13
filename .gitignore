@@ -4,3 +4,5 @@ __pycache__/
 runs/
 checkpoints/
 data/
+
+*.mp4
