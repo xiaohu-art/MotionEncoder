@@ -9,19 +9,15 @@ from sklearn.model_selection import train_test_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dataset import VAEDataLoader
+from dataset import MotionDataset
 from model import AutoEncoder
-
-def get_dataset_path(dataset_name):
-    """Get data path based on dataset name."""
-    dataset_paths = f"data/scaled/{dataset_name}_scaled.pkl"
-    return dataset_paths
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train AutoEncoder with configurable args.")
     # data and path
-    p.add_argument("--dataset", type=str, default="sfu", 
-                   choices=["accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
+    p.add_argument("--dataset", type=str, default="amass_train", 
+                   choices=["amass_train", "amass_test",
+                            "accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
                             "dancedb", "dfaust", "ekut", "eyes_japan", "hdm05",
                             "human4d", "humaneva", "kit", "mosh", "poseprior",
                             "sfu", "soma", "ssm", "tcdhands", "totalcapture", "transitions"],
@@ -35,7 +31,7 @@ def parse_args():
     p.add_argument("--log-dir", type=str, default="runs/ae_experiment_split",
                    help="log dir")
     # training hyperparams
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4, help="learning rate")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--seq-len", type=int, default=150)
@@ -62,18 +58,30 @@ def train_one_epoch(model, dataloader, optimizer, device):
     
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     for batch in progress_bar:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        reconstructed_output = model(batch)
+        # For motion dataset: ((raw_input, scaled_input), scaled_target)
+        (raw_input, scaled_input), scaled_target = batch
+        raw_input = raw_input.to(device)
+        scaled_input = scaled_input.to(device)
+        scaled_target = scaled_target.to(device)
         
-        recon_loss = nn.functional.mse_loss(reconstructed_output, batch)
-        total_loss = recon_loss
+        optimizer.zero_grad()
+        
+        # Forward pass for both input types
+        raw_output = model(raw_input)
+        scaled_output = model(scaled_input)
+        
+        # Compute losses for both input types (both targeting scaled output)
+        loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
+        loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
+        
+        # Total loss is the sum of both losses
+        total_loss = loss_raw + loss_scaled
         
         total_loss.backward()
         optimizer.step()
         
         total_train_loss += total_loss.item()
-        progress_bar.set_postfix(loss=total_loss.item(), recon=recon_loss.item())
+        progress_bar.set_postfix(loss=total_loss.item())
 
     return total_train_loss / len(dataloader)
 
@@ -83,14 +91,25 @@ def validate(model, dataloader, device):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
         for batch in progress_bar:
-            batch = batch.to(device)
-            reconstructed_output = model(batch)
+                # For motion dataset: ((raw_input, scaled_input), scaled_target)
+            (raw_input, scaled_input), scaled_target = batch
+            raw_input = raw_input.to(device)
+            scaled_input = scaled_input.to(device)
+            scaled_target = scaled_target.to(device)
             
-            recon_loss = nn.functional.mse_loss(reconstructed_output, batch)
-            total_loss = recon_loss
+            # Forward pass for both input types
+            raw_output = model(raw_input)
+            scaled_output = model(scaled_input)
+            
+            # Compute losses for both input types (both targeting scaled output)
+            loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
+            loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
+            
+            # Total loss is the sum of both losses
+            total_loss = loss_raw + loss_scaled
             
             total_val_loss += total_loss.item()
-            progress_bar.set_postfix(loss=total_loss.item(), recon=recon_loss.item())
+            progress_bar.set_postfix(loss=total_loss.item())
             
     return total_val_loss / len(dataloader)
 
@@ -106,23 +125,27 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     # Determine data path
-    data_path = args.data_path if args.data_path is not None else get_dataset_path(args.dataset)
     print(f"Using dataset: {args.dataset}")
-    print(f"Data path: {data_path}")
+    raw_data, scaled_data = MotionDataset.load_data_pair(args.dataset)
     
     # --- Paths and Logging ---
     BEST_MODEL_PATH = os.path.join(args.checkpoint_dir, args.best_model_name)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
-
+        
     print("Loading data and splitting keys...")
-    full_data = joblib.load(data_path)
-    all_keys = list(full_data.keys())
+    all_keys = list(raw_data.keys())
     train_keys, val_keys = train_test_split(all_keys, test_size=args.val_split, random_state=args.seed)
     print(f"Total sequences: {len(all_keys)}. Training: {len(train_keys)}, Validation: {len(val_keys)}")
 
-    train_dataset = VAEDataLoader(data=full_data, keys_to_use=train_keys, seq_len=args.seq_len)
-    val_dataset = VAEDataLoader(data=full_data, keys_to_use=val_keys, seq_len=args.seq_len)
+    train_dataset = MotionDataset(  raw_data=raw_data, 
+                                    scaled_data=scaled_data, 
+                                    keys_to_use=train_keys, 
+                                    seq_len=args.seq_len)
+    val_dataset = MotionDataset(    raw_data=raw_data, 
+                                    scaled_data=scaled_data, 
+                                    keys_to_use=val_keys, 
+                                    seq_len=args.seq_len)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)

@@ -10,18 +10,14 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
 from model import AutoEncoder
-from dataset import VAEDataLoader
-
-def get_dataset_path(dataset_name):
-    """Get data path based on dataset name."""
-    dataset_paths = f"data/scaled/{dataset_name}_scaled.pkl"
-    return dataset_paths
+from dataset import MotionDataset
 
 def parse_args():
     p = argparse.ArgumentParser(description="Inference with AutoEncoder for motion reconstruction.")
     # data and path
-    p.add_argument("--dataset", type=str, default="sfu", 
-                   choices=["accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
+    p.add_argument("--dataset", type=str, default="amass_test", 
+                   choices=["amass_train", "amass_test",
+                            "accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
                             "dancedb", "dfaust", "ekut", "eyes_japan", "hdm05",
                             "human4d", "humaneva", "kit", "mosh", "poseprior",
                             "sfu", "soma", "ssm", "tcdhands", "totalcapture", "transitions"],
@@ -43,6 +39,9 @@ def parse_args():
     p.add_argument("--fps", type=int, default=30, help="fps of the output video")
     # device
     p.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto")
+    # input type for visualization
+    p.add_argument("--input-type", type=str, choices=["raw", "scaled"], default="raw",
+                   help="Input type for inference: 'raw' or 'scaled'")
     return p.parse_args()
 
 def get_device(device_arg):
@@ -51,17 +50,17 @@ def get_device(device_arg):
     else:
         return torch.device(device_arg)
 
-def animate_3d_comparison(joints_orig, joints_recon, title="", output_file="ae_sfu.mp4", fps=30):
+def animate_3d_comparison(joints_input, joints_recon, title="", output_file="*.mp4", fps=30):
     """
-    Animates a 3D comparison between original (blue) and reconstructed (red) keypoints.
+    Animates a 3D comparison between input (blue) and reconstructed (red) keypoints.
     """
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection='3d')
 
-    scatter_orig = ax.scatter([], [], [], c='blue', marker='o', label='Original', s=20)
+    scatter_input = ax.scatter([], [], [], c='blue', marker='o', label='Input', s=20)
     scatter_recon = ax.scatter([], [], [], c='red', marker='o', label='Reconstructed', s=20)
 
-    all_points = np.concatenate([joints_orig, joints_recon], axis=0)
+    all_points = np.concatenate([joints_input, joints_recon], axis=0)
     min_vals = all_points.min(axis=(0,1))
     max_vals = all_points.max(axis=(0,1))
     ax.set_xlim(min_vals[0] - 0.2, max_vals[0] + 0.2)
@@ -69,7 +68,7 @@ def animate_3d_comparison(joints_orig, joints_recon, title="", output_file="ae_s
     ax.set_zlim(min_vals[2] - 0.2, max_vals[2] + 0.2)
     
     def update(num):
-        scatter_orig._offsets3d = (joints_orig[num, :, 0], joints_orig[num, :, 1], joints_orig[num, :, 2])
+        scatter_input._offsets3d = (joints_input[num, :, 0], joints_input[num, :, 1], joints_input[num, :, 2])
         scatter_recon._offsets3d = (joints_recon[num, :, 0], joints_recon[num, :, 1], joints_recon[num, :, 2])
         ax.set_title(f"{title} - Frame {num}")
 
@@ -81,7 +80,7 @@ def animate_3d_comparison(joints_orig, joints_recon, title="", output_file="ae_s
     ax.quiver(0, 0, 0, 0, 1, 0, color='g', length=0.1)
     ax.quiver(0, 0, 0, 0, 0, 1, color='b', length=0.1)
 
-    num_frames = joints_orig.shape[0]
+    num_frames = joints_input.shape[0]
     interval = int(1000 / fps)  # Convert fps to interval in milliseconds
     ani = animation.FuncAnimation(fig, update, frames=num_frames, interval=interval, blit=False)
     ani.save(output_file, writer='ffmpeg', fps=fps)
@@ -94,16 +93,16 @@ if __name__ == "__main__":
     device = get_device(args.device)
     print(f"Using device: {device}")
     
-    # Determine data path
-    data_path = args.data_path if args.data_path is not None else get_dataset_path(args.dataset)
+    # Load both raw and scaled data
     print(f"Using dataset: {args.dataset}")
-    print(f"Data path: {data_path}")
+    raw_data, scaled_data = MotionDataset.load_data_pair(args.dataset)
     
     # Generate output video filename
-    output_video = args.output_video if args.output_video is not None else f"{args.dataset}_{args.test_key}.mp4"
+    output_video = args.output_video if args.output_video is not None else f"{args.dataset}_{args.input_type}_{args.test_key}.mp4"
     print(f"Output video: {output_video}")
 
-    temp_dataset = VAEDataLoader(data={}, keys_to_use=[], seq_len=1)
+    # Get data dimension from a sample
+    temp_dataset = MotionDataset(raw_data=raw_data, scaled_data=scaled_data, keys_to_use=[list(raw_data.keys())[0]], seq_len=1)
     DATA_DIM = temp_dataset.data_dim
     
     print("Loading original model...")
@@ -116,9 +115,16 @@ if __name__ == "__main__":
     model.eval()
     print("Model loaded successfully.")
 
-    full_data = joblib.load(data_path)
-    test_key = list(full_data.keys())[args.test_key]
-    motion_data = full_data[test_key]
+    test_key = list(raw_data.keys())[args.test_key]
+    
+    # Choose input data based on input_type argument
+    if args.input_type == "raw":
+        motion_data = raw_data[test_key]
+        print(f"Using raw data for inference")
+    else:  # scaled
+        motion_data = scaled_data[test_key]
+        print(f"Using scaled data for inference")
+    
     combined_input = torch.tensor(
         np.concatenate([
             motion_data['root_trans_offset'],
@@ -153,14 +159,24 @@ if __name__ == "__main__":
 
     print("\nPreparing data for animation...")
     
-    orig_kps_np = motion_data['smpl_joints']
-
+    # Input keypoints (model input)
+    input_kps_np = motion_data['smpl_joints']
+    
+    # Reconstructed keypoints (model output)
     recon_kps_flat = reconstruction[:, 7:]
-    
     recon_kps = recon_kps_flat.reshape(num_frames, 24, 3)
-    
     recon_kps_np = recon_kps.cpu().numpy()
 
     print("Starting animation... Close the plot window to exit.")
-    animate_3d_comparison(orig_kps_np, recon_kps_np, title=f"Motion: {test_key}", 
-                         output_file=output_video, fps=args.fps)
+    
+    # Create appropriate title based on input type
+    if args.input_type == "raw":
+        title = f"Raw→Scaled: {test_key}"
+        # Show: Raw input (blue) vs Reconstructed scaled output (red)
+        animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
+                             output_file=output_video, fps=args.fps)
+    else:  # scaled
+        title = f"Scaled→Scaled: {test_key}"
+        # Show: Scaled input (blue) vs Reconstructed scaled output (red)
+        animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
+                             output_file=output_video, fps=args.fps)
