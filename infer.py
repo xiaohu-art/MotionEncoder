@@ -86,6 +86,91 @@ def animate_3d_comparison(joints_input, joints_recon, title="", output_file="*.m
     ani.save(output_file, writer='ffmpeg', fps=fps)
     # plt.show()
 
+def _quat_angle_deg(q1, q2):
+    cos = np.abs(np.sum(q1 * q2, axis=-1))
+    cos = np.clip(cos, 0.0, 1.0)
+    return np.degrees(2.0 * np.arccos(cos))
+
+def animate_3d_and_quat(joints_input, joints_recon, quat_input, quat_recon,
+                        title="", output_file="*.mp4", fps=30):
+    """
+    Left: 3D keypoints (blue=input, red=recon) with optional orientation triads.
+    Right-top: quaternion components (w,x,y,z) for input (dashed) and recon (solid).
+    Right-bottom: geodesic angle error (degrees).
+    """
+    ang_deg     = _quat_angle_deg(quat_input, quat_recon)  # [T]
+
+    T = joints_input.shape[0]
+    assert joints_recon.shape[0] == T == quat_input.shape[0] == quat_recon.shape[0]
+
+    # --- figure layout ---
+    fig = plt.figure(figsize=(12, 6))
+    gs = fig.add_gridspec(2, 2, width_ratios=[2.0, 1.4], height_ratios=[2.5, 1.0])
+    ax3d   = fig.add_subplot(gs[:, 0], projection='3d')
+    axQuat = fig.add_subplot(gs[0, 1])
+    axErr  = fig.add_subplot(gs[1, 1])
+
+    # --- 3D scatter (keypoints) ---
+    scatter_input = ax3d.scatter([], [], [], c='blue', marker='o', label='Input', s=15)
+    scatter_recon = ax3d.scatter([], [], [], c='red', marker='o', label='Reconstructed', s=15)
+
+    all_points = np.concatenate([joints_input, joints_recon], axis=0)  # [2T, J, 3]
+    min_vals = all_points.min(axis=(0,1))
+    max_vals = all_points.max(axis=(0,1))
+    pad = 0.2
+    ax3d.set_xlim(min_vals[0]-pad, max_vals[0]+pad)
+    ax3d.set_ylim(min_vals[1]-pad, max_vals[1]+pad)
+    ax3d.set_zlim(min_vals[2]-pad, max_vals[2]+pad)
+    ax3d.set_xlabel('X'); ax3d.set_ylabel('Y'); ax3d.set_zlabel('Z')
+    ax3d.set_title(title)
+    ax3d.legend(loc='upper right')
+
+    # global frame
+    ax3d.quiver(0,0,0, 1,0,0, color='r', length=0.12)
+    ax3d.quiver(0,0,0, 0,1,0, color='g', length=0.12)
+    ax3d.quiver(0,0,0, 0,0,1, color='b', length=0.12)
+
+    # --- Quaternion components panel ---
+    t = np.arange(T)
+    labels = ['w','x','y','z']
+    lines_in = []
+    lines_rec = []
+    for i in range(4):
+        (line_in,)  = axQuat.plot(t, quat_input[:, i],  linestyle='--', linewidth=1.2, label=f'{labels[i]} (in)')
+        (line_rec,) = axQuat.plot(t, quat_recon[:, i],  linestyle='-',  linewidth=1.5, label=f'{labels[i]} (rec)')
+        lines_in.append(line_in); lines_rec.append(line_rec)
+    cursor_quat = axQuat.axvline(0, color='k', linewidth=1)
+    axQuat.set_xlim(0, T-1)
+    axQuat.set_ylim(-1.05, 1.05)
+    axQuat.set_title('Root rotation quaternion (components)')
+    axQuat.set_xlabel('Frame'); axQuat.set_ylabel('value')
+    axQuat.legend(ncol=2, fontsize=8)
+
+    # --- Angle error panel ---
+    (line_err,) = axErr.plot(t, ang_deg)
+    cursor_err = axErr.axvline(0, color='k', linewidth=1)
+    axErr.set_xlim(0, T-1)
+    axErr.set_ylim(0.0, max(1.0, np.nanmax(ang_deg) * 1.1))
+    axErr.set_title('Geodesic angle error (deg)')
+    axErr.set_xlabel('Frame'); axErr.set_ylabel('deg')
+
+    # --- update function ---
+    def update(f):
+        # keypoints
+        p_in  = joints_input[f]
+        p_rec = joints_recon[f]
+        scatter_input._offsets3d = (p_in[:,0],  p_in[:,1],  p_in[:,2])
+        scatter_recon._offsets3d = (p_rec[:,0], p_rec[:,1], p_rec[:,2])
+        ax3d.set_title(f"{title} - Frame {f}")
+        # move the cursors
+        cursor_quat.set_xdata([f, f])
+        cursor_err.set_xdata([f, f])
+        return (scatter_input, scatter_recon, cursor_quat, cursor_err)
+
+    interval = int(1000 / fps)
+    ani = animation.FuncAnimation(fig, update, frames=T, interval=interval, blit=False)
+    ani.save(output_file, writer='ffmpeg', fps=fps)
+
 if __name__ == "__main__":
     args = parse_args()
     
@@ -161,11 +246,14 @@ if __name__ == "__main__":
     
     # Input keypoints (model input)
     input_kps_np = motion_data['smpl_joints']
+    input_quat_np = motion_data['root_rot']
     
     # Reconstructed keypoints (model output)
     recon_kps_flat = reconstruction[:, 7:]
     recon_kps = recon_kps_flat.reshape(num_frames, 24, 3)
     recon_kps_np = recon_kps.cpu().numpy()
+
+    recon_quat_np = reconstruction[:, 3:7].cpu().numpy()
 
     print("Starting animation... Close the plot window to exit.")
     
@@ -173,10 +261,14 @@ if __name__ == "__main__":
     if args.input_type == "raw":
         title = f"Raw→Scaled: {test_key}"
         # Show: Raw input (blue) vs Reconstructed scaled output (red)
-        animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
-                             output_file=output_video, fps=args.fps)
+        # animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
+        #                      output_file=output_video, fps=args.fps)
+        animate_3d_and_quat(input_kps_np, recon_kps_np, input_quat_np, recon_quat_np, title=title, 
+                            output_file=output_video, fps=args.fps)
     else:  # scaled
         title = f"Scaled→Scaled: {test_key}"
         # Show: Scaled input (blue) vs Reconstructed scaled output (red)
-        animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
-                             output_file=output_video, fps=args.fps)
+        # animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
+        #                      output_file=output_video, fps=args.fps)
+        animate_3d_and_quat(input_kps_np, recon_kps_np, input_quat_np, recon_quat_np, title=title, 
+                            output_file=output_video, fps=args.fps)
