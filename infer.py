@@ -40,8 +40,8 @@ def parse_args():
     # device
     p.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto")
     # input type for visualization
-    p.add_argument("--input-type", type=str, choices=["raw", "scaled"], default="raw",
-                   help="Input type for inference: 'raw' or 'scaled'")
+    p.add_argument("--input-type", type=str, choices=["raw", "augmented", "scaled"], default="raw",
+                   help="Input type for inference: 'raw', 'augmented', or 'scaled'")
     return p.parse_args()
 
 def get_device(device_arg):
@@ -206,6 +206,16 @@ if __name__ == "__main__":
     if args.input_type == "raw":
         motion_data = raw_data[test_key]
         print(f"Using raw data for inference")
+    elif args.input_type == "augmented":
+        scale_factor = np.random.uniform(0.8, 1.0)
+        motion_data = raw_data[test_key]
+        motion_data['root_trans_offset'], motion_data['root_rot'], motion_data['smpl_joints'] = MotionDataset._scale_augment(
+            motion_data['root_trans_offset'],
+            motion_data['root_rot'],
+            motion_data['smpl_joints'],
+            scale_factor
+        )
+        print(f"Using augmented data for inference, scale factor: {scale_factor:.2f}")
     else:  # scaled
         motion_data = scaled_data[test_key]
         print(f"Using scaled data for inference")

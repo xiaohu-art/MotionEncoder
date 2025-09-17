@@ -1,8 +1,10 @@
+import os
+import joblib
+import numpy as np
+
 import torch
 from torch.utils.data import Dataset
-import joblib
 from torch.utils.data import DataLoader
-import os
 
 class MotionDataset(Dataset):
     """
@@ -17,16 +19,19 @@ class MotionDataset(Dataset):
                  raw_data: dict, 
                  scaled_data: dict,
                  seq_len: int,
-                 keys_to_use: list):
+                 keys_to_use: list,
+                 scale_range: tuple = (0.8, 1.0)):
         """
         Args:
         - raw_data: The pre-loaded raw data dictionary from joblib.load().
         - scaled_data: The pre-loaded scaled data dictionary from joblib.load().
         - seq_len: Sequence length for each sample.
         - keys_to_use: A list of motion sequence keys to include in this dataset.
+        - scale_range: Tuple of (min_scale, max_scale) for the scale augmentation.
         """
         self.keys_to_use = keys_to_use
         self.seq_len = seq_len
+        self.scale_range = scale_range
 
         self.trajs = []
         for key in self.keys_to_use:
@@ -41,6 +46,12 @@ class MotionDataset(Dataset):
             raw_root_trans = raw_dump['root_trans_offset']
             raw_root_rot = raw_dump['root_rot']
             raw_kps = raw_dump['smpl_joints']
+
+            # Get augmented data
+            scale_factor = np.random.uniform(self.scale_range[0], self.scale_range[1])
+            augmented_root_trans, augmented_root_rot, augmented_kps = MotionDataset._scale_augment(
+                raw_root_trans, raw_root_rot, raw_kps, scale_factor
+            )
             
             # Extract scaled data (target)
             scaled_root_trans = scaled_dump['root_trans_offset']
@@ -59,6 +70,10 @@ class MotionDataset(Dataset):
                 raw_root_trans=raw_root_trans,
                 raw_root_rot=raw_root_rot,
                 raw_kps=raw_kps,
+                # Augmented data (input)
+                augmented_root_trans=augmented_root_trans,
+                augmented_root_rot=augmented_root_rot,
+                augmented_kps=augmented_kps,
                 # Scaled data (target)
                 scaled_root_trans=scaled_root_trans,
                 scaled_root_rot=scaled_root_rot,
@@ -82,6 +97,16 @@ class MotionDataset(Dataset):
         self.data_dim = 3 + 4 + 24 * 3
         
         print(f"Loaded {len(self.trajs)} trajectories with {len(self.index)} total samples")
+
+    @staticmethod
+    def _scale_augment(root_trans: np.ndarray, root_rot: np.ndarray, kps: np.ndarray, scale_factor: float):
+        seq_len, num_kps, _ = kps.shape
+        scaled_kps = (kps - root_trans[:, None, :]) * scale_factor + root_trans[:, None, :]
+        min_z = scaled_kps[..., 2].min()
+        scaled_kps[..., 2] -= min_z
+        scaled_root_trans = scaled_kps[:, 0].copy()
+        scaled_root_rot = root_rot.copy()
+        return scaled_root_trans, scaled_root_rot, scaled_kps
     
     def __len__(self):
         return len(self.index)
@@ -94,6 +119,11 @@ class MotionDataset(Dataset):
         raw_root_trans = torch.tensor(traj['raw_root_trans'][si:ei], dtype=torch.float32)
         raw_root_rot = torch.tensor(traj['raw_root_rot'][si:ei], dtype=torch.float32)
         raw_kps = torch.tensor(traj['raw_kps'][si:ei], dtype=torch.float32)
+
+        # Get augmented data
+        augmented_root_trans = torch.tensor(traj['augmented_root_trans'][si:ei], dtype=torch.float32)
+        augmented_root_rot = torch.tensor(traj['augmented_root_rot'][si:ei], dtype=torch.float32)
+        augmented_kps = torch.tensor(traj['augmented_kps'][si:ei], dtype=torch.float32)
         
         # Get scaled data
         scaled_root_trans = torch.tensor(traj['scaled_root_trans'][si:ei], dtype=torch.float32)
@@ -101,18 +131,21 @@ class MotionDataset(Dataset):
         scaled_kps = torch.tensor(traj['scaled_kps'][si:ei], dtype=torch.float32)
         
         assert raw_root_trans.shape[0] == raw_root_rot.shape[0] == raw_kps.shape[0] == self.seq_len
+        assert augmented_root_trans.shape[0] == augmented_root_rot.shape[0] == augmented_kps.shape[0] == self.seq_len
         assert scaled_root_trans.shape[0] == scaled_root_rot.shape[0] == scaled_kps.shape[0] == self.seq_len
 
         # Flatten keypoints
         raw_kp_flat = raw_kps.reshape(self.seq_len, -1)
+        augmented_kp_flat = augmented_kps.reshape(self.seq_len, -1)
         scaled_kp_flat = scaled_kps.reshape(self.seq_len, -1)
         
         # Concatenate features
         raw_data = torch.cat([raw_root_trans, raw_root_rot, raw_kp_flat], dim=1).to(torch.float32)
+        augmented_data = torch.cat([augmented_root_trans, augmented_root_rot, augmented_kp_flat], dim=1).to(torch.float32)
         scaled_data = torch.cat([scaled_root_trans, scaled_root_rot, scaled_kp_flat], dim=1).to(torch.float32)
         scaled_target = torch.cat([scaled_root_trans, scaled_root_rot, scaled_kp_flat], dim=1).to(torch.float32)
 
-        return (raw_data, scaled_data), scaled_target
+        return (raw_data, augmented_data, scaled_data), scaled_target
 
     @classmethod
     def load_data_pair(cls, dataset_name, data_dir="data"):
@@ -156,9 +189,10 @@ if __name__ == "__main__":
         )
         
         dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-        for batch_idx, ((raw_input, scaled_data), scaled_target) in enumerate(dataloader):
+        for batch_idx, ((raw_input, augmented_input, scaled_data), scaled_target) in enumerate(dataloader):
             print(f"Batch {batch_idx}:")
             print(f"  Raw input shape: {raw_input.shape}")      # [B, seq_len, data_dim]
+            print(f"  Augmented input shape: {augmented_input.shape}")  # [B, seq_len, data_dim]
             print(f"  Scaled data shape: {scaled_data.shape}")  # [B, seq_len, data_dim]
             print(f"  Scaled target shape: {scaled_target.shape}")  # [B, seq_len, data_dim]
             break

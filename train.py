@@ -59,8 +59,9 @@ def train_one_epoch(model, dataloader, optimizer, device):
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     for batch in progress_bar:
         # For motion dataset: ((raw_input, scaled_input), scaled_target)
-        (raw_input, scaled_input), scaled_target = batch
+        (raw_input, augmented_input, scaled_input), scaled_target = batch
         raw_input = raw_input.to(device)
+        augmented_input = augmented_input.to(device)
         scaled_input = scaled_input.to(device)
         scaled_target = scaled_target.to(device)
         
@@ -68,14 +69,16 @@ def train_one_epoch(model, dataloader, optimizer, device):
         
         # Forward pass for both input types
         raw_output = model(raw_input)
+        augmented_output = model(augmented_input)
         scaled_output = model(scaled_input)
         
         # Compute losses for both input types (both targeting scaled output)
         loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
+        loss_augmented = nn.functional.mse_loss(augmented_output, scaled_target)
         loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
         
         # Total loss is the sum of both losses
-        total_loss = loss_raw + loss_scaled
+        total_loss = loss_raw + loss_augmented + loss_scaled
         
         total_loss.backward()
         optimizer.step()
@@ -91,22 +94,25 @@ def validate(model, dataloader, device):
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
         for batch in progress_bar:
-                # For motion dataset: ((raw_input, scaled_input), scaled_target)
-            (raw_input, scaled_input), scaled_target = batch
+            # For motion dataset: ((raw_input, scaled_input), scaled_target)
+            (raw_input, augmented_input, scaled_input), scaled_target = batch
             raw_input = raw_input.to(device)
+            augmented_input = augmented_input.to(device)
             scaled_input = scaled_input.to(device)
             scaled_target = scaled_target.to(device)
             
             # Forward pass for both input types
             raw_output = model(raw_input)
+            augmented_output = model(augmented_input)
             scaled_output = model(scaled_input)
             
             # Compute losses for both input types (both targeting scaled output)
             loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
+            loss_augmented = nn.functional.mse_loss(augmented_output, scaled_target)
             loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
             
             # Total loss is the sum of both losses
-            total_loss = loss_raw + loss_scaled
+            total_loss = loss_raw + loss_augmented + loss_scaled
             
             total_val_loss += total_loss.item()
             progress_bar.set_postfix(loss=total_loss.item())
