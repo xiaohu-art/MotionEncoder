@@ -21,10 +21,28 @@ class SpatialGNN(nn.Module):
         self.num_nodes = SMPL_J24_NUM_NODES
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.edges = torch.tensor(SMPL_J24_EDGES, dtype=torch.long).t().contiguous()
+
+        self.register_buffer(
+            'edges', 
+            torch.tensor(SMPL_J24_EDGES, dtype=torch.long).t().contiguous()
+        )
         
         self.gnn1 = GCNConv(in_dim, out_dim * 2)
         self.gnn2 = GCNConv(out_dim * 2, out_dim)
+        
+        self.cache = {}
+
+    def _batch_edges(self, G: int, N: int):
+        if (G, N) in self.cache:
+            return self.cache[(G, N)]
+
+        _, E = self.edges.shape
+        edges_g = self.edges.unsqueeze(0).expand(G, -1, -1).clone()
+        offsets = torch.arange(G, device=self.edges.device).view(G, 1, 1) * N
+        edges_g += offsets                      # [G, 2, E]
+        edges = edges_g.permute(1, 0, 2).reshape(2, G * E) 
+        self.cache[(G, N)] = edges
+        return edges
 
     def forward(self, joints_xyz: torch.Tensor):
         '''
@@ -34,12 +52,11 @@ class SpatialGNN(nn.Module):
         '''
         B, T, N, _ = joints_xyz.shape
         x = joints_xyz.reshape(B * T * N, -1)    # [B*T*N, 3]
-        
-        edge_index = self.edges.to(joints_xyz.device)
-        batch = torch.arange(B * T, device=joints_xyz.device).repeat_interleave(N)
-        
-        x = self.gnn1(x, edge_index, batch)
-        x = self.gnn2(x, edge_index, batch)
+        edges = self._batch_edges(G=B * T, N=N)
+
+        x = self.gnn1(x, edges)
+        x = F.gelu(x)
+        x = self.gnn2(x, edges)
         x = x.reshape(B, T, N, -1) # [B, T, N, out_dim]
         return x
 
@@ -88,9 +105,9 @@ class AutoEncoder(nn.Module):
         self.data_dim = data_dim
         self.latent_dim = latent_dim
 
-        self.spatial_gnn = SpatialGNN(in_dim=3, out_dim=latent_dim)
+        self.spatial_gnn = SpatialGNN()
 
-        per_frame_dim = 7 + self.spatial_gnn.num_nodes * latent_dim
+        per_frame_dim = 7 + self.spatial_gnn.num_nodes * self.spatial_gnn.out_dim
         self.input_proj = nn.Linear(per_frame_dim, latent_dim)
         self.pos_embed = PositionalEmbedding(latent_dim, max_len=2048)
         

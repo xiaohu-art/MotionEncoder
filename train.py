@@ -161,6 +161,18 @@ if __name__ == "__main__":
                 data_dim=train_dataset.data_dim,
                 latent_dim=args.latent_dim, 
             ).to(device)
+
+    try:
+        model = torch.compile(
+            model,
+            backend="inductor",
+            mode="max-autotune",
+            fullgraph=False,
+            dynamic=True,
+        )
+        print("[compile] torch.compile enabled.")
+    except Exception as e:
+        print(f"[compile] fell back to eager due to: {e}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     params_m = num_params / 1e6
     print(f"Number of trainable parameters: {params_m:.2f}M")
