@@ -83,3 +83,6 @@ class AutoEncoder(nn.Module):
         decoded_sequence = self.quat_unit_norm(decoded_sequence)
 
         return decoded_sequence
+
+if __name__ == "__main__":
+    pass

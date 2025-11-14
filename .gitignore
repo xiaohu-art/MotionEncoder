@@ -1,5 +1,7 @@
 __pycache__/
-.venv-py310
+
+py38/
+smpl/
 
 runs/
 checkpoints/
