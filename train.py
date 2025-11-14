@@ -1,29 +1,27 @@
+import os
+import argparse
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-import os
-import joblib
-import argparse
-import numpy as np
-from sklearn.model_selection import train_test_split
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from smplx import SMPL
 
 from dataset import MotionDataset
 from model import AutoEncoder
 
+from utils import quat_error_magnitude, prepare_motion_batch
+
 def parse_args():
     p = argparse.ArgumentParser(description="Train AutoEncoder with configurable args.")
     # data and path
-    p.add_argument("--dataset", type=str, default="amass_train", 
-                   choices=["amass_train", "amass_test",
-                            "accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
-                            "dancedb", "dfaust", "ekut", "eyes_japan", "hdm05",
-                            "human4d", "humaneva", "kit", "mosh", "poseprior",
-                            "sfu", "soma", "ssm", "tcdhands", "totalcapture", "transitions"],
-                   help="dataset name (will auto-assign data path)")
-    p.add_argument("--data-path", type=str, default=None,
-                   help="data path (overrides dataset-based path if specified)")
+    p.add_argument("--data-path", type=str, default="data/train",
+                   help="absolute path to directory containing *.npz")
+    p.add_argument("--body-model-path", type=str, default="smpl",
+                   help="directory containing SMPL body model files")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints",
                    help="checkpoint dir")
     p.add_argument("--best-model-name", type=str, default="ae_best_model.pth",
@@ -52,70 +50,48 @@ def get_device(device_arg):
     else:
         return torch.device(device_arg)
 
-def train_one_epoch(model, dataloader, optimizer, device):
+def train_one_epoch(model, dataloader, body_model, device):
     model.train()
     total_train_loss = 0.0
     
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     for batch in progress_bar:
-        # For motion dataset: ((raw_input, scaled_input), scaled_target)
-        (raw_input, augmented_input, scaled_input), scaled_target = batch
-        raw_input = raw_input.to(device)
-        augmented_input = augmented_input.to(device)
-        scaled_input = scaled_input.to(device)
-        scaled_target = scaled_target.to(device)
+        motion = prepare_motion_batch(batch, body_model, device)
+        betas = motion["betas"]
+        global_orient = motion["global_orient"]
+        joints = motion["joints"]
         
         optimizer.zero_grad()
         
-        # Forward pass for both input types
-        raw_output = model(raw_input)
-        augmented_output = model(augmented_input)
-        scaled_output = model(scaled_input)
-        
-        # Compute losses for both input types (both targeting scaled output)
-        loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
-        loss_augmented = nn.functional.mse_loss(augmented_output, scaled_target)
-        loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
-        
-        # Total loss is the sum of both losses
-        total_loss = loss_raw + loss_augmented + loss_scaled
-        
-        total_loss.backward()
+        recon_global_orient, recon_joints = model(global_orient, joints, betas)
+        orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
+        joint_loss = F.mse_loss(recon_joints, joints)
+        loss = orientation_loss + joint_loss
+        loss.backward()
         optimizer.step()
         
-        total_train_loss += total_loss.item()
-        progress_bar.set_postfix(loss=total_loss.item())
+        total_train_loss += loss.item()
+        progress_bar.set_postfix(loss=loss.item())
 
     return total_train_loss / len(dataloader)
 
-def validate(model, dataloader, device):
+def validate(model, dataloader, body_model, device):
     model.eval()
     total_val_loss = 0.0
     with torch.no_grad():
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
         for batch in progress_bar:
-            # For motion dataset: ((raw_input, scaled_input), scaled_target)
-            (raw_input, augmented_input, scaled_input), scaled_target = batch
-            raw_input = raw_input.to(device)
-            augmented_input = augmented_input.to(device)
-            scaled_input = scaled_input.to(device)
-            scaled_target = scaled_target.to(device)
-            
-            # Forward pass for both input types
-            raw_output = model(raw_input)
-            augmented_output = model(augmented_input)
-            scaled_output = model(scaled_input)
-            
-            # Compute losses for both input types (both targeting scaled output)
-            loss_raw = nn.functional.mse_loss(raw_output, scaled_target)
-            loss_augmented = nn.functional.mse_loss(augmented_output, scaled_target)
-            loss_scaled = nn.functional.mse_loss(scaled_output, scaled_target)
-            
-            # Total loss is the sum of both losses
-            total_loss = loss_raw + loss_augmented + loss_scaled
-            
-            total_val_loss += total_loss.item()
-            progress_bar.set_postfix(loss=total_loss.item())
+            motion = prepare_motion_batch(batch, body_model, device)
+            betas = motion["betas"]
+            global_orient = motion["global_orient"]
+            joints = motion["joints"]
+
+            recon_global_orient, recon_joints = model(global_orient, joints, betas)
+            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
+            joint_loss = F.mse_loss(recon_joints, joints)
+            loss = orientation_loss + joint_loss
+            total_val_loss += loss.item()
+            progress_bar.set_postfix(loss=loss.item())
             
     return total_val_loss / len(dataloader)
 
@@ -130,40 +106,61 @@ if __name__ == "__main__":
     device = get_device(args.device)
     print(f"Using device: {device}")
     
-    # Determine data path
-    print(f"Using dataset: {args.dataset}")
-    raw_data, scaled_data = MotionDataset.load_data_pair(args.dataset)
+    print(f"Loading motions from: {args.data_path}")
     
     # --- Paths and Logging ---
     BEST_MODEL_PATH = os.path.join(args.checkpoint_dir, args.best_model_name)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
         
-    print("Loading data and splitting keys...")
-    all_keys = list(raw_data.keys())
-    train_keys, val_keys = train_test_split(all_keys, test_size=args.val_split, random_state=args.seed)
-    print(f"Total sequences: {len(all_keys)}. Training: {len(train_keys)}, Validation: {len(val_keys)}")
+    base_dataset = MotionDataset(
+        data_path=args.data_path,
+        seq_len=args.seq_len,
+    )
 
-    train_dataset = MotionDataset(  raw_data=raw_data, 
-                                    scaled_data=scaled_data, 
-                                    keys_to_use=train_keys, 
-                                    seq_len=args.seq_len)
-    val_dataset = MotionDataset(    raw_data=raw_data, 
-                                    scaled_data=scaled_data, 
-                                    keys_to_use=val_keys, 
-                                    seq_len=args.seq_len)
+    val_size = int(len(base_dataset) * args.val_split)
+    train_size = len(base_dataset) - val_size
+    if train_size <= 0 or val_size <= 0:
+        raise ValueError("val_split must be between 0 and 1 (exclusive) and dataset must have enough samples.")
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    train_dataset, val_dataset = random_split(
+        base_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
+    body_model = SMPL(model_path=args.body_model_path, gender="neutral").to(device)
 
     # --- Model, Optimizer, Scheduler ---
     model = AutoEncoder(
-                data_dim=train_dataset.data_dim,
-                latent_dim=args.latent_dim, 
-            ).to(device)
+        latent_dim=args.latent_dim,
+        orient_dim=4,
+        num_joints=24,
+        joint_dim=3,
+        beta_dim=10,
+    ).to(device)
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     params_m = num_params / 1e6
     print(f"Number of trainable parameters: {params_m:.2f}M")
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('medium')
+    model = torch.compile(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -178,8 +175,8 @@ if __name__ == "__main__":
     global_step = 0
 
     for epoch in range(args.epochs):
-        avg_train_loss = train_one_epoch(model, train_dataloader, optimizer, device)
-        avg_val_loss = validate(model, val_dataloader, device)
+        avg_train_loss = train_one_epoch(model, train_dataloader, body_model, device)
+        avg_val_loss = validate(model, val_dataloader, body_model, device)
         
         print(f"Epoch [{epoch+1}/{args.epochs}] | Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
         

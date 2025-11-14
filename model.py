@@ -5,6 +5,9 @@ import torch.nn.functional as F
 
 from dataset import MotionDataset
 from torch.utils.data import DataLoader
+from smplx import SMPL
+
+from utils import prepare_motion_batch
 
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 100):
@@ -117,15 +120,21 @@ class AutoEncoder(nn.Module):
         decoded_sequence = self.decoder(decoder_input)
         decoded_sequence = self.quat_unit_norm(decoded_sequence)
 
-        return decoded_sequence
+        decoded_global_orient = decoded_sequence[..., :self.orient_dim]
+        decoded_joints = decoded_sequence[..., self.orient_dim:]
+        return decoded_global_orient, decoded_joints.reshape(B, T, self.num_joints, self.joint_dim)
 
 if __name__ == "__main__":
     torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     dataset = MotionDataset(
         data_path="data/train",
         seq_len=150,
     )
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+
+    body_model = SMPL(model_path="smpl", gender="neutral").to(device)
 
     model = AutoEncoder(
         latent_dim=256,
@@ -135,17 +144,19 @@ if __name__ == "__main__":
         beta_dim=10,
         nhead=4,
         num_layers=2,
-    )
-
+    ).to(device)
+    
     batch = next(iter(dataloader))
-    betas = batch["betas"].squeeze(1)  # [B, beta_dim]
-    global_orient = batch["global_orient"]  # [B, T, 4]
-    joints = batch["joints"]  # [B, T, 24, 3]
+    motion = prepare_motion_batch(batch, body_model, device)
+    betas = motion["betas"]
+    global_orient = motion["global_orient"]
+    joints = motion["joints"]
 
     with torch.no_grad():
-        recon = model(global_orient, joints, betas)
+        recon_global_orient, recon_joints = model(global_orient, joints, betas)
 
     print(f"Input global_orient shape: {global_orient.shape}")
     print(f"Input joints shape: {joints.shape}")
     print(f"Input betas shape: {betas.shape}")
-    print(f"Reconstructed motion shape: {recon.shape}")
+    print(f"Reconstructed global_orient shape: {recon_global_orient.shape}")
+    print(f"Reconstructed joints shape: {recon_joints.shape}")
