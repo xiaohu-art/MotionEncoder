@@ -22,7 +22,8 @@ class MotionDataset(Dataset):
         self,
         data_path: str,
         seq_len: int,
-        scale_range: tuple = (0.5, 1.5)
+        scale_range: tuple = (0.5, 1.5),
+        num_joints: int = 24,
     ):
         """
         Args:
@@ -35,6 +36,7 @@ class MotionDataset(Dataset):
         self.data_path = os.path.abspath(data_path)
         self.seq_len = int(seq_len)
         self.scale_range = scale_range
+        self.num_joints = num_joints
 
         glob_pattern = "**/*.npz"
         self.file_paths = glob.glob(os.path.join(self.data_path, glob_pattern), recursive=True)
@@ -49,13 +51,13 @@ class MotionDataset(Dataset):
             try:
                 with np.load(file_path, allow_pickle=True) as data:
                     if "poses" not in data or "trans" not in data:
-                        print(f"[WARN] '{file_path}' missing required keys, skipping.")
+                        # print(f"[WARN] '{file_path}' missing required keys, skipping.")
                         continue
                     
                     parts = os.path.splitext(file_path)[0].split("/")[-3:]
                     name = "-".join(parts)
                     traj = dict(
-                        poses=data["poses"].astype(np.float32),  # (T, 156)
+                        poses=data["poses"].astype(np.float32)[:, :self.num_joints * 3],  # (T, 156)
                         trans=data["trans"].astype(np.float32),  # (T, 3)
                         betas=data["betas"].astype(np.float32)
                     )
@@ -65,9 +67,9 @@ class MotionDataset(Dataset):
 
             T = traj["poses"].shape[0]
             if T < self.seq_len:
-                print(
-                    f"[WARN] '{file_path}' has only {T} frames (seq_len={self.seq_len}), skipping."
-                )
+                # print(
+                #     f"[WARN] '{file_path}' has only {T} frames (seq_len={self.seq_len}), skipping."
+                # )
                 continue
 
             traj["length"] = T
@@ -111,11 +113,15 @@ class MotionDataset(Dataset):
 
 if __name__ == "__main__":
     dataset = MotionDataset(
-        data_path="data/train",
+        data_path="data",
         seq_len=150
     )
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-    batch = next(iter(dataloader))
-    print(f"Poses shape: {batch['poses'].shape}")
-    print(f"Trans shape: {batch['trans'].shape}")
-    print(f"Betas shape: {batch['betas'].shape}")
+    try:
+        for idx, batch in enumerate(dataloader):
+            print(f"Batch {idx}:")
+            print(f"  Poses shape: {batch['poses'].shape}")
+            print(f"  Trans shape: {batch['trans'].shape}")
+            print(f"  Betas shape: {batch['betas'].shape}")
+    except Exception as e:
+        print(f"Error: {e} at index {idx}")

@@ -28,22 +28,6 @@ class PositionalEmbedding(nn.Module):
         x = x + self.pe[:, :T, :D]
         return x
 
-class QuatUnitNorm(nn.Module):
-    def __init__(self, rot_start=3, rot_dim=4):
-        super().__init__()
-        self.rot_start = rot_start
-        self.rot_dim = rot_dim
-
-    def forward(self, y: torch.Tensor):
-        # y: [B, T, D]
-        s, e = self.rot_start, self.rot_start + self.rot_dim
-        rt  = y[..., :s]
-        rr  = y[..., s:e]
-        kps = y[..., e:]
-        rr  = F.normalize(rr, p=2, dim=-1, eps=1e-12)  # unit quaternion
-        return torch.cat([rt, rr, kps], dim=-1)
-
-
 class AutoEncoder(nn.Module):
     def __init__(
         self,
@@ -75,14 +59,13 @@ class AutoEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         decoder_input_dim = latent_dim + self.beta_dim
-        self.decoder = nn.Sequential(
+        self.decoder_backbone = nn.Sequential(
             nn.LayerNorm(decoder_input_dim),
             nn.Linear(decoder_input_dim, latent_dim),
-            nn.GELU(),
-            nn.Linear(latent_dim, self.motion_dim),
+            nn.GELU()
         )
-
-        self.quat_unit_norm = QuatUnitNorm(rot_start=0, rot_dim=self.orient_dim)
+        self.head_orient = nn.Linear(latent_dim, self.orient_dim)
+        self.head_joints = nn.Linear(latent_dim, self.num_joints * self.joint_dim)
 
     def forward(
         self,
@@ -117,19 +100,29 @@ class AutoEncoder(nn.Module):
             betas = betas.expand(-1, seq_len, -1)
 
         decoder_input = torch.cat([encoded, betas], dim=-1)
-        decoded_sequence = self.decoder(decoder_input)
-        decoded_sequence = self.quat_unit_norm(decoded_sequence)
+        hidden_state = self.decoder_backbone(decoder_input) # [B, T, latent_dim]
 
-        decoded_global_orient = decoded_sequence[..., :self.orient_dim]
-        decoded_joints = decoded_sequence[..., self.orient_dim:]
-        return decoded_global_orient, decoded_joints.reshape(B, T, self.num_joints, self.joint_dim)
+        decoded_global_orient = self.head_orient(hidden_state)               # [B, T, orient_dim]
+        decoded_global_orient = F.normalize(
+            decoded_global_orient,
+            p=2,
+            dim=-1,
+            eps=1e-12
+        )
+
+        decoded_joints_flat = self.head_joints(hidden_state)                 # [B, T, num_joints*3]
+        decoded_joints = decoded_joints_flat.view(
+            B, T, self.num_joints, self.joint_dim
+        )  # [B, T, num_joints, 3]
+
+        return decoded_global_orient, decoded_joints
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = MotionDataset(
-        data_path="data/train",
+        data_path="data",
         seq_len=150,
     )
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)

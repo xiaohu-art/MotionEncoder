@@ -18,7 +18,7 @@ from utils import quat_error_magnitude, prepare_motion_batch
 def parse_args():
     p = argparse.ArgumentParser(description="Train AutoEncoder with configurable args.")
     # data and path
-    p.add_argument("--data-path", type=str, default="data/train",
+    p.add_argument("--data-path", type=str, default="data",
                    help="absolute path to directory containing *.npz")
     p.add_argument("--body-model-path", type=str, default="smpl",
                    help="directory containing SMPL body model files")
@@ -29,16 +29,16 @@ def parse_args():
     p.add_argument("--log-dir", type=str, default="runs/ae_experiment_split",
                    help="log dir")
     # training hyperparams
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-4, help="learning rate")
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--lr", type=float, default=2e-4, help="learning rate")
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--seq-len", type=int, default=150)
     p.add_argument("--latent-dim", type=int, default=256)
     p.add_argument("--val-split", type=float, default=0.2)
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
     # scheduler
-    p.add_argument("--t-max", type=int, default=50, help="CosineAnnealingLR T_max, same as epochs")
+    p.add_argument("--t-max", type=int, default=20, help="CosineAnnealingLR T_max, same as epochs")
     p.add_argument("--eta-min", type=float, default=1e-6, help="CosineAnnealingLR eta_min")
     # device
     p.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto")
@@ -49,6 +49,8 @@ def get_device(device_arg):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         return torch.device(device_arg)
+
+scaler = torch.amp.GradScaler('cuda')
 
 def train_one_epoch(model, dataloader, body_model, device):
     model.train()
@@ -61,18 +63,24 @@ def train_one_epoch(model, dataloader, body_model, device):
         global_orient = motion["global_orient"]
         joints = motion["joints"]
         
-        optimizer.zero_grad()
-        
-        recon_global_orient, recon_joints = model(global_orient, joints, betas)
-        orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
-        joint_loss = F.mse_loss(recon_joints, joints)
-        loss = orientation_loss + joint_loss
-        loss.backward()
-        optimizer.step()
-        
-        total_train_loss += loss.item()
-        progress_bar.set_postfix(loss=loss.item())
+        optimizer.zero_grad(set_to_none=True)
 
+        with torch.amp.autocast('cuda', dtype=torch.float16):
+            recon_global_orient, recon_joints = model(global_orient, joints, betas)
+            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
+            joint_loss = F.mse_loss(recon_joints, joints)
+            loss = orientation_loss + joint_loss
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_train_loss += loss.item()
+        progress_bar.set_postfix(
+            loss=loss.item(),
+            orientation_loss=orientation_loss.item(),
+            joint_loss=joint_loss.item()
+        )
     return total_train_loss / len(dataloader)
 
 def validate(model, dataloader, body_model, device):
@@ -91,7 +99,7 @@ def validate(model, dataloader, body_model, device):
             joint_loss = F.mse_loss(recon_joints, joints)
             loss = orientation_loss + joint_loss
             total_val_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item())
+            progress_bar.set_postfix(loss=loss.item(), orientation_loss=orientation_loss.item(), joint_loss=joint_loss.item())
             
     return total_val_loss / len(dataloader)
 
@@ -135,6 +143,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=True,
     )
     val_dataloader = DataLoader(
         val_dataset,
@@ -142,6 +151,7 @@ if __name__ == "__main__":
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=True,
     )
 
     body_model = SMPL(model_path=args.body_model_path, gender="neutral").to(device)

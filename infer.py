@@ -1,47 +1,41 @@
-import torch
-import numpy as np
-import joblib
 import argparse
 import os
-from tqdm import tqdm
 from collections import deque
 
-import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from tqdm import tqdm
 
-from model import AutoEncoder
 from dataset import MotionDataset
+from model import AutoEncoder
+from smplx import SMPL
+
+from utils import prepare_motion_batch
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Inference with AutoEncoder for motion reconstruction.")
-    # data and path
-    p.add_argument("--dataset", type=str, default="amass_test", 
-                   choices=["amass_train", "amass_test",
-                            "accad", "bmlhandball", "bmlmovi", "bmlrub", "cmu", 
-                            "dancedb", "dfaust", "ekut", "eyes_japan", "hdm05",
-                            "human4d", "humaneva", "kit", "mosh", "poseprior",
-                            "sfu", "soma", "ssm", "tcdhands", "totalcapture", "transitions"],
-                   help="dataset name (will auto-assign data path)")
-    p.add_argument("--data-path", type=str, default=None,
-                   help="data path (overrides dataset-based path if specified)")
+    p.add_argument("--data-path", type=str, default="data",
+                   help="root directory containing *.npz motion files")
+    p.add_argument("--body-model-path", type=str, default="smpl",
+                   help="directory containing SMPL body model files")
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints",
-                   help="checkpoint dir")
+                   help="directory containing trained checkpoints")
     p.add_argument("--best-model-name", type=str, default="ae_best_model.pth",
-                   help="best model name")
+                   help="checkpoint filename to load")
     p.add_argument("--output-video", type=str, default=None,
-                   help="output video name (auto-generated from dataset and test-key if not specified)")
-    # model params
-    p.add_argument("--seq-len", type=int, default=150)
+                   help="output video path; defaults to traj_<idx>.mp4")
+    p.add_argument("--seq-len", type=int, default=150,
+                   help="sequence length for model context")
     p.add_argument("--latent-dim", type=int, default=256)
-    # inference params
-    p.add_argument("--test-key", type=int, default=0,
-                   help="test key, use the first one if not specified")
+    p.add_argument("--traj-idx", type=int, default=0,
+                   help="index of the trajectory to visualize")
+    p.add_argument("--traj-name", type=str, default=None,
+                   help="explicit trajectory key to visualize (overrides --traj-idx)")
     p.add_argument("--fps", type=int, default=30, help="fps of the output video")
-    # device
     p.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto")
-    # input type for visualization
-    p.add_argument("--input-type", type=str, choices=["raw", "augmented", "scaled"], default="raw",
-                   help="Input type for inference: 'raw', 'augmented', or 'scaled'")
     return p.parse_args()
 
 def get_device(device_arg):
@@ -49,42 +43,6 @@ def get_device(device_arg):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         return torch.device(device_arg)
-
-def animate_3d_comparison(joints_input, joints_recon, title="", output_file="*.mp4", fps=30):
-    """
-    Animates a 3D comparison between input (blue) and reconstructed (red) keypoints.
-    """
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection='3d')
-
-    scatter_input = ax.scatter([], [], [], c='blue', marker='o', label='Input', s=20)
-    scatter_recon = ax.scatter([], [], [], c='red', marker='o', label='Reconstructed', s=20)
-
-    all_points = np.concatenate([joints_input, joints_recon], axis=0)
-    min_vals = all_points.min(axis=(0,1))
-    max_vals = all_points.max(axis=(0,1))
-    ax.set_xlim(min_vals[0] - 0.2, max_vals[0] + 0.2)
-    ax.set_ylim(min_vals[1] - 0.2, max_vals[1] + 0.2)
-    ax.set_zlim(min_vals[2] - 0.2, max_vals[2] + 0.2)
-    
-    def update(num):
-        scatter_input._offsets3d = (joints_input[num, :, 0], joints_input[num, :, 1], joints_input[num, :, 2])
-        scatter_recon._offsets3d = (joints_recon[num, :, 0], joints_recon[num, :, 1], joints_recon[num, :, 2])
-        ax.set_title(f"{title} - Frame {num}")
-
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.legend()
-    ax.quiver(0, 0, 0, 1, 0, 0, color='r', length=0.1)
-    ax.quiver(0, 0, 0, 0, 1, 0, color='g', length=0.1)
-    ax.quiver(0, 0, 0, 0, 0, 1, color='b', length=0.1)
-
-    num_frames = joints_input.shape[0]
-    interval = int(1000 / fps)  # Convert fps to interval in milliseconds
-    ani = animation.FuncAnimation(fig, update, frames=num_frames, interval=interval, blit=False)
-    ani.save(output_file, writer='ffmpeg', fps=fps)
-    # plt.show()
 
 def _quat_angle_deg(q1, q2):
     cos = np.abs(np.sum(q1 * q2, axis=-1))
@@ -173,112 +131,115 @@ def animate_3d_and_quat(joints_input, joints_recon, quat_input, quat_recon,
 
 if __name__ == "__main__":
     args = parse_args()
-    
-    # Get device
+
     device = get_device(args.device)
     print(f"Using device: {device}")
-    
-    # Load both raw and scaled data
-    print(f"Using dataset: {args.dataset}")
-    raw_data, scaled_data = MotionDataset.load_data_pair(args.dataset)
-    
-    # Generate output video filename
-    output_video = args.output_video if args.output_video is not None else f"{args.dataset}_{args.input_type}_{args.test_key}.mp4"
+
+    dataset = MotionDataset(
+        data_path=args.data_path,
+        seq_len=args.seq_len,
+    )
+    if len(dataset.trajs) == 0:
+        raise RuntimeError("Dataset contains no trajectories.")
+
+    traj_keys = sorted(dataset.trajs.keys())
+    if args.traj_name is not None:
+        if args.traj_name not in dataset.trajs:
+            raise ValueError(f"Trajectory {args.traj_name} not found in dataset.")
+        traj_key = args.traj_name
+    else:
+        if args.traj_idx >= len(traj_keys):
+            raise ValueError(f"traj-idx {args.traj_idx} out of range (len={len(traj_keys)})")
+        traj_key = traj_keys[args.traj_idx]
+
+    print(f"Selected trajectory: {traj_key}")
+    traj = dataset.trajs[traj_key]
+    poses = torch.from_numpy(traj["poses"]).float().unsqueeze(0)
+    trans = torch.from_numpy(traj["trans"]).float().unsqueeze(0)
+    betas = torch.from_numpy(traj["betas"][:10]).float().unsqueeze(0)
+
+    output_video = args.output_video or f"{traj_key.replace('/', '_')}.mp4"
     print(f"Output video: {output_video}")
 
-    # Get data dimension from a sample
-    temp_dataset = MotionDataset(raw_data=raw_data, scaled_data=scaled_data, keys_to_use=[list(raw_data.keys())[0]], seq_len=1)
-    DATA_DIM = temp_dataset.data_dim
-    
-    print("Loading original model...")
+    print("Loading SMPL body model...")
+    body_model = SMPL(model_path=args.body_model_path, gender="neutral").to(device)
+
+    print("Loading trained autoencoder...")
     model = AutoEncoder(
-        data_dim=DATA_DIM, latent_dim=args.latent_dim
+        latent_dim=args.latent_dim,
+        orient_dim=4,
+        num_joints=24,
+        joint_dim=3,
+        beta_dim=10,
     ).to(device)
-    BEST_MODEL_PATH = os.path.join(args.checkpoint_dir, args.best_model_name)
-    checkpoint = torch.load(BEST_MODEL_PATH, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = torch.compile(model)
+    
+    checkpoint_path = os.path.join(args.checkpoint_dir, args.best_model_name)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print("Model loaded successfully.")
 
-    test_key = list(raw_data.keys())[args.test_key]
-    
-    # Choose input data based on input_type argument
-    if args.input_type == "raw":
-        motion_data = raw_data[test_key]
-        print(f"Using raw data for inference")
-    elif args.input_type == "augmented":
-        scale_factor = np.random.uniform(0.8, 1.0)
-        motion_data = raw_data[test_key]
-        motion_data['root_trans_offset'], motion_data['root_rot'], motion_data['smpl_joints'] = MotionDataset._scale_augment(
-            motion_data['root_trans_offset'],
-            motion_data['root_rot'],
-            motion_data['smpl_joints'],
-            scale_factor
-        )
-        print(f"Using augmented data for inference, scale factor: {scale_factor:.2f}")
-    else:  # scaled
-        motion_data = scaled_data[test_key]
-        print(f"Using scaled data for inference")
-    
-    combined_input = torch.tensor(
-        np.concatenate([
-            motion_data['root_trans_offset'],
-            motion_data['root_rot'],
-            motion_data['smpl_joints'].reshape(motion_data['smpl_joints'].shape[0], -1)
-        ], axis=1), dtype=torch.float32
-    ).to(device)
-    num_frames = combined_input.shape[0]
+    print("Preparing motion via SMPL...")
+    batched_sample = {
+        "poses": poses,
+        "trans": trans,
+        "betas": betas,
+    }
+    motion = prepare_motion_batch(batched_sample, body_model, device)
 
-    print(f"\nStarting fixed-length streaming inference for {num_frames} frames...")
-    
-    context_queue = deque(maxlen=args.seq_len)
-    reconstructions = []
+    betas_seq = motion["betas"]
+    global_orient_seq = motion["global_orient"]
+    joints_seq = motion["joints"]
 
-    for t in tqdm(range(num_frames), desc="Streaming Inference"):
-        current_frame = combined_input[t]
-        context_queue.append(current_frame)
-        
-        current_context_tensor = torch.stack(list(context_queue), dim=0).unsqueeze(0)
-        
+    B, T, _, _ = joints_seq.shape
+    assert B == 1, "Inference currently supports batch size 1."
+
+    context_orient = deque(maxlen=args.seq_len)
+    context_joints = deque(maxlen=args.seq_len)
+
+    recon_quats = []
+    recon_joints = []
+    input_quats = []
+    input_joints = []
+
+    print("Streaming through the trajectory...")
+    for t in tqdm(range(T), desc="Streaming Inference"):
+        orient_t = global_orient_seq[0, t]
+        joints_t = joints_seq[0, t]
+        input_quats.append(orient_t.detach().cpu())
+        input_joints.append(joints_t.detach().cpu())
+
+        context_orient.append(orient_t)
+        context_joints.append(joints_t)
+
+        if len(context_orient) < args.seq_len:
+            recon_quats.append(orient_t.detach().cpu())
+            recon_joints.append(joints_t.detach().cpu())
+            continue
+
+        orient_tensor = torch.stack(list(context_orient), dim=0).unsqueeze(0)
+        joints_tensor = torch.stack(list(context_joints), dim=0).unsqueeze(0)
+
         with torch.no_grad():
-            reconstructed_context = model(current_context_tensor)
-            current_recon_frame = reconstructed_context[:, -1, :]
-        
-        reconstructions.append(current_recon_frame)
+            recon_orient_seq, recon_joints_seq = model(
+                orient_tensor, joints_tensor, betas_seq
+            )
+        recon_quats.append(recon_orient_seq[:, -1].squeeze(0).detach().cpu())
+        recon_joints.append(recon_joints_seq[:, -1].squeeze(0).detach().cpu())
 
-    reconstruction = torch.cat(reconstructions, dim=0)
-    
-    print("Streaming inference complete.")
-    print(f"Input shape: {combined_input.shape}")
-    print(f"Reconstructed shape: {reconstruction.shape}")
-
-    print("\nPreparing data for animation...")
-    
-    # Input keypoints (model input)
-    input_kps_np = motion_data['smpl_joints']
-    input_quat_np = motion_data['root_rot']
-    
-    # Reconstructed keypoints (model output)
-    recon_kps_flat = reconstruction[:, 7:]
-    recon_kps = recon_kps_flat.reshape(num_frames, 24, 3)
-    recon_kps_np = recon_kps.cpu().numpy()
-
-    recon_quat_np = reconstruction[:, 3:7].cpu().numpy()
+    input_quats_np = torch.stack(input_quats, dim=0).numpy()
+    input_joints_np = torch.stack(input_joints, dim=0).numpy()
+    recon_quats_np = torch.stack(recon_quats, dim=0).numpy()
+    recon_joints_np = torch.stack(recon_joints, dim=0).numpy()
 
     print("Starting animation... Close the plot window to exit.")
-    
-    # Create appropriate title based on input type
-    if args.input_type == "raw":
-        title = f"Raw→Scaled: {test_key}"
-        # Show: Raw input (blue) vs Reconstructed scaled output (red)
-        # animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
-        #                      output_file=output_video, fps=args.fps)
-        animate_3d_and_quat(input_kps_np, recon_kps_np, input_quat_np, recon_quat_np, title=title, 
-                            output_file=output_video, fps=args.fps)
-    else:  # scaled
-        title = f"Scaled→Scaled: {test_key}"
-        # Show: Scaled input (blue) vs Reconstructed scaled output (red)
-        # animate_3d_comparison(input_kps_np, recon_kps_np, title=title, 
-        #                      output_file=output_video, fps=args.fps)
-        animate_3d_and_quat(input_kps_np, recon_kps_np, input_quat_np, recon_quat_np, title=title, 
-                            output_file=output_video, fps=args.fps)
+    animate_3d_and_quat(
+        input_joints_np,
+        recon_joints_np,
+        input_quats_np,
+        recon_quats_np,
+        title=traj_key,
+        output_file=output_video,
+        fps=args.fps,
+    )
