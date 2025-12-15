@@ -59,16 +59,23 @@ def train_one_epoch(model, dataloader, body_model, device):
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     for batch in progress_bar:
         motion = prepare_motion_batch(batch, body_model, device)
-        betas = motion["betas"]
+        # Encoder input: original beta's global_orient and joints
         global_orient = motion["global_orient"]
         joints = motion["joints"]
+        # Decoder modulation: augmented beta
+        betas_augmented = motion["betas_augmented"]
+        # Loss target: augmented beta's global_orient and joints
+        global_orient_target = motion["global_orient_target"]
+        joints_target = motion["joints_target"]
         
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', dtype=torch.float16):
-            recon_global_orient, recon_joints = model(global_orient, joints, betas)
-            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
-            joint_loss = F.mse_loss(recon_joints, joints)
+            # Encoder uses original beta's motion, decoder uses augmented beta
+            recon_global_orient, recon_joints = model(global_orient, joints, betas_augmented)
+            # Loss computed against augmented beta's targets
+            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient_target).mean()
+            joint_loss = F.mse_loss(recon_joints, joints_target)
             loss = orientation_loss + joint_loss
 
         scaler.scale(loss).backward()
@@ -90,13 +97,20 @@ def validate(model, dataloader, body_model, device):
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
         for batch in progress_bar:
             motion = prepare_motion_batch(batch, body_model, device)
-            betas = motion["betas"]
+            # Encoder input: original beta's global_orient and joints
             global_orient = motion["global_orient"]
             joints = motion["joints"]
+            # Decoder modulation: augmented beta
+            betas_augmented = motion["betas_augmented"]
+            # Loss target: augmented beta's global_orient and joints
+            global_orient_target = motion["global_orient_target"]
+            joints_target = motion["joints_target"]
 
-            recon_global_orient, recon_joints = model(global_orient, joints, betas)
-            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient).mean()
-            joint_loss = F.mse_loss(recon_joints, joints)
+            # Encoder uses original beta's motion, decoder uses augmented beta
+            recon_global_orient, recon_joints = model(global_orient, joints, betas_augmented)
+            # Loss computed against augmented beta's targets
+            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient_target).mean()
+            joint_loss = F.mse_loss(recon_joints, joints_target)
             loss = orientation_loss + joint_loss
             total_val_loss += loss.item()
             progress_bar.set_postfix(loss=loss.item(), orientation_loss=orientation_loss.item(), joint_loss=joint_loss.item())
@@ -170,7 +184,9 @@ if __name__ == "__main__":
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision('medium')
-    model = torch.compile(model)
+    # torch.compile requires Triton which may not be available on Windows
+    # Uncomment the line below if you have Triton installed and want to use it
+    # model = torch.compile(model)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

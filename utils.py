@@ -150,11 +150,33 @@ def prepare_motion_batch(
     body_model,
     device: torch.device,
     max_body_joints: int = 22,
+    beta_augment_std: float = 0.1,
 ):
     """
     Converts raw AMASS data into betas, global orientations (quaternions),
     and joints suitable for the AutoEncoder. Heavy SMPL computations stay
     outside the dataset and run here on the chosen device.
+    
+    Now supports beta augmentation:
+    - Encoder input: original beta's global_orient and joints
+    - Decoder modulation: augmented beta
+    - Loss target: augmented beta's global_orient and joints
+    
+    Args:
+        batch: Dictionary containing 'poses', 'trans', 'betas'
+        body_model: SMPL body model
+        device: torch device
+        max_body_joints: Maximum number of body joints to use
+        beta_augment_std: Standard deviation for beta augmentation (Gaussian noise)
+    
+    Returns:
+        Dictionary with:
+            - 'betas': original betas [B, 10] (for encoder input context, not used directly)
+            - 'betas_augmented': augmented betas [B, 10] (for decoder modulation)
+            - 'global_orient': original beta's global_orient [B, T, 4] (for encoder input)
+            - 'joints': original beta's joints [B, T, 24, 3] (for encoder input)
+            - 'global_orient_target': augmented beta's global_orient [B, T, 4] (for loss)
+            - 'joints_target': augmented beta's joints [B, T, 24, 3] (for loss)
     """
     poses = batch["poses"].to(device)  # [B, T, 156]
     trans = batch["trans"].to(device)  # [B, T, 3]
@@ -171,27 +193,56 @@ def prepare_motion_batch(
     smpl_body_pose = body_pose.reshape(B * T, -1)
     smpl_global_orient = global_orient.reshape(B * T, 3)
     smpl_trans = trans.reshape(B * T, 3)
-    smpl_betas = betas[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
+    
+    # Prepare original betas
+    smpl_betas_original = betas[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
+    
+    # Augment betas with Gaussian noise
+    betas_augmented = betas + torch.randn_like(betas) * beta_augment_std
+    smpl_betas_augmented = betas_augmented[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
 
     with torch.no_grad():
-        smpl_output = body_model(
-            betas=smpl_betas,
+        # Compute with original betas (for encoder input)
+        smpl_output_original = body_model(
+            betas=smpl_betas_original,
+            body_pose=smpl_body_pose,
+            global_orient=smpl_global_orient,
+            transl=smpl_trans,
+        )
+        
+        # Compute with augmented betas (for loss target)
+        smpl_output_augmented = body_model(
+            betas=smpl_betas_augmented,
             body_pose=smpl_body_pose,
             global_orient=smpl_global_orient,
             transl=smpl_trans,
         )
 
-    vertices = smpl_output.vertices.reshape(B, T, -1, 3)
-    joints = smpl_output.joints[:, :24, :].reshape(B, T, 24, 3)
-    height_offset = vertices[..., 2].min()
-    joints[..., 2] -= height_offset
+    # Process original beta outputs (for encoder input)
+    vertices_original = smpl_output_original.vertices.reshape(B, T, -1, 3)
+    joints_original = smpl_output_original.joints[:, :24, :].reshape(B, T, 24, 3)
+    height_offset_original = vertices_original[..., 2].min()
+    joints_original[..., 2] -= height_offset_original
 
-    global_orient_quat = quat_from_angle_axis(
-        smpl_output.global_orient.reshape(B, T, 3)
+    global_orient_quat_original = quat_from_angle_axis(
+        smpl_output_original.global_orient.reshape(B, T, 3)
+    )
+    
+    # Process augmented beta outputs (for loss target)
+    vertices_augmented = smpl_output_augmented.vertices.reshape(B, T, -1, 3)
+    joints_augmented = smpl_output_augmented.joints[:, :24, :].reshape(B, T, 24, 3)
+    height_offset_augmented = vertices_augmented[..., 2].min()
+    joints_augmented[..., 2] -= height_offset_augmented
+
+    global_orient_quat_augmented = quat_from_angle_axis(
+        smpl_output_augmented.global_orient.reshape(B, T, 3)
     )
 
     return {
-        "betas": betas,
-        "global_orient": global_orient_quat,
-        "joints": joints,
+        "betas": betas,  # Original betas (kept for backward compatibility)
+        "betas_augmented": betas_augmented,  # Augmented betas for decoder modulation
+        "global_orient": global_orient_quat_original,  # Original beta's global_orient (encoder input)
+        "joints": joints_original,  # Original beta's joints (encoder input)
+        "global_orient_target": global_orient_quat_augmented,  # Augmented beta's global_orient (loss target)
+        "joints_target": joints_augmented,  # Augmented beta's joints (loss target)
     }

@@ -141,6 +141,8 @@ if __name__ == "__main__":
     
     batch = next(iter(dataloader))
     motion = prepare_motion_batch(batch, body_model, device)
+    
+    # For testing, use original betas (no augmentation)
     betas = motion["betas"]
     global_orient = motion["global_orient"]
     joints = motion["joints"]

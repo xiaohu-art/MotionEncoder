@@ -172,7 +172,9 @@ if __name__ == "__main__":
         joint_dim=3,
         beta_dim=10,
     ).to(device)
-    model = torch.compile(model)
+    # torch.compile requires Triton which may not be available on Windows
+    # Uncomment the line below if you have Triton installed and want to use it
+    # model = torch.compile(model)
     
     checkpoint_path = os.path.join(args.checkpoint_dir, args.best_model_name)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -186,8 +188,10 @@ if __name__ == "__main__":
         "trans": trans,
         "betas": betas,
     }
-    motion = prepare_motion_batch(batched_sample, body_model, device)
+    # Disable beta augmentation during inference (set std=0)
+    motion = prepare_motion_batch(batched_sample, body_model, device, beta_augment_std=0.0)
 
+    # For inference, use original betas (no augmentation)
     betas_seq = motion["betas"]
     global_orient_seq = motion["global_orient"]
     joints_seq = motion["joints"]
