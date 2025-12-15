@@ -172,9 +172,7 @@ if __name__ == "__main__":
         joint_dim=3,
         beta_dim=10,
     ).to(device)
-    # torch.compile requires Triton which may not be available on Windows
-    # Uncomment the line below if you have Triton installed and want to use it
-    # model = torch.compile(model)
+    model = torch.compile(model)
     
     checkpoint_path = os.path.join(args.checkpoint_dir, args.best_model_name)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -188,11 +186,12 @@ if __name__ == "__main__":
         "trans": trans,
         "betas": betas,
     }
-    # Disable beta augmentation during inference (set std=0)
-    motion = prepare_motion_batch(batched_sample, body_model, device, beta_augment_std=0.0)
+    # Disable beta and scale augmentation during inference (set std=0)
+    motion = prepare_motion_batch(batched_sample, body_model, device, beta_augment_std=0.0, scale_augment_std=0.0)
 
-    # For inference, use original betas (no augmentation)
+    # For inference, use original betas and scale (no augmentation)
     betas_seq = motion["betas"]
+    scale_seq = motion["scale"]  # Original scale (1.0)
     global_orient_seq = motion["global_orient"]
     joints_seq = motion["joints"]
 
@@ -227,7 +226,7 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             recon_orient_seq, recon_joints_seq = model(
-                orient_tensor, joints_tensor, betas_seq
+                orient_tensor, joints_tensor, betas_seq, scale_seq
             )
         recon_quats.append(recon_orient_seq[:, -1].squeeze(0).detach().cpu())
         recon_joints.append(recon_joints_seq[:, -1].squeeze(0).detach().cpu())

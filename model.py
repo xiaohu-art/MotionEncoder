@@ -58,7 +58,7 @@ class AutoEncoder(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        decoder_input_dim = latent_dim + self.beta_dim
+        decoder_input_dim = latent_dim + self.beta_dim + 1  # +1 for scale
         self.decoder_backbone = nn.Sequential(
             nn.LayerNorm(decoder_input_dim),
             nn.Linear(decoder_input_dim, latent_dim),
@@ -72,12 +72,14 @@ class AutoEncoder(nn.Module):
         global_orient: torch.Tensor,
         joints: torch.Tensor,
         betas: torch.Tensor,
+        scale: torch.Tensor = None,
     ):
         """
         Args:
             global_orient: [B, T, orient_dim] quaternion rotations.
             joints: [B, T, num_joints, joint_dim] joint coordinates.
             betas: [B, beta_dim] or [B, 1, beta_dim] shape embeddings.
+            scale: [B, 1] or [B, 1, 1] scale values. If None, defaults to 1.0.
         """
         B, T, _, _ = joints.shape
         motion = torch.cat(
@@ -99,7 +101,15 @@ class AutoEncoder(nn.Module):
         if betas.shape[1] != seq_len:
             betas = betas.expand(-1, seq_len, -1)
 
-        decoder_input = torch.cat([encoded, betas], dim=-1)
+        # Handle scale: if None, use 1.0; ensure shape is [B, 1, 1] then expand to [B, T, 1]
+        if scale is None:
+            scale = torch.ones(B, 1, device=device)
+        if scale.dim() == 2:
+            scale = scale.unsqueeze(1)  # [B, 1, 1]
+        if scale.shape[1] != seq_len:
+            scale = scale.expand(-1, seq_len, -1)  # [B, T, 1]
+
+        decoder_input = torch.cat([encoded, betas, scale], dim=-1)
         hidden_state = self.decoder_backbone(decoder_input) # [B, T, latent_dim]
 
         decoded_global_orient = self.head_orient(hidden_state)               # [B, T, orient_dim]
@@ -140,15 +150,16 @@ if __name__ == "__main__":
     ).to(device)
     
     batch = next(iter(dataloader))
-    motion = prepare_motion_batch(batch, body_model, device)
+    motion = prepare_motion_batch(batch, body_model, device, beta_augment_std=0.0, scale_augment_std=0.0)
     
-    # For testing, use original betas (no augmentation)
+    # For testing, use original betas and scale (no augmentation)
     betas = motion["betas"]
+    scale = motion["scale"]  # Original scale (1.0)
     global_orient = motion["global_orient"]
     joints = motion["joints"]
 
     with torch.no_grad():
-        recon_global_orient, recon_joints = model(global_orient, joints, betas)
+        recon_global_orient, recon_joints = model(global_orient, joints, betas, scale)
 
     print(f"Input global_orient shape: {global_orient.shape}")
     print(f"Input joints shape: {joints.shape}")

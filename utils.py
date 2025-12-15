@@ -145,38 +145,27 @@ def quat_error_magnitude(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     return torch.norm(axis_angle_error, dim=-1)
 
 
-def prepare_motion_batch(
+def prepare_original_motion(
     batch: dict,
     body_model,
     device: torch.device,
     max_body_joints: int = 22,
-    beta_augment_std: float = 0.1,
 ):
     """
-    Converts raw AMASS data into betas, global orientations (quaternions),
-    and joints suitable for the AutoEncoder. Heavy SMPL computations stay
-    outside the dataset and run here on the chosen device.
-    
-    Now supports beta augmentation:
-    - Encoder input: original beta's global_orient and joints
-    - Decoder modulation: augmented beta
-    - Loss target: augmented beta's global_orient and joints
+    Prepares original motion data with original betas and scale=1.
     
     Args:
         batch: Dictionary containing 'poses', 'trans', 'betas'
         body_model: SMPL body model
         device: torch device
         max_body_joints: Maximum number of body joints to use
-        beta_augment_std: Standard deviation for beta augmentation (Gaussian noise)
     
     Returns:
         Dictionary with:
-            - 'betas': original betas [B, 10] (for encoder input context, not used directly)
-            - 'betas_augmented': augmented betas [B, 10] (for decoder modulation)
-            - 'global_orient': original beta's global_orient [B, T, 4] (for encoder input)
-            - 'joints': original beta's joints [B, T, 24, 3] (for encoder input)
-            - 'global_orient_target': augmented beta's global_orient [B, T, 4] (for loss)
-            - 'joints_target': augmented beta's joints [B, T, 24, 3] (for loss)
+            - 'betas': original betas [B, 10]
+            - 'scale': original scale [B, 1] (always 1.0)
+            - 'global_orient': original beta's global_orient [B, T, 4]
+            - 'joints': original beta's joints [B, T, 24, 3]
     """
     poses = batch["poses"].to(device)  # [B, T, 156]
     trans = batch["trans"].to(device)  # [B, T, 3]
@@ -194,31 +183,19 @@ def prepare_motion_batch(
     smpl_global_orient = global_orient.reshape(B * T, 3)
     smpl_trans = trans.reshape(B * T, 3)
     
-    # Prepare original betas
+    # Prepare original betas (scale = 1.0)
     smpl_betas_original = betas[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
-    
-    # Augment betas with Gaussian noise
-    betas_augmented = betas + torch.randn_like(betas) * beta_augment_std
-    smpl_betas_augmented = betas_augmented[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
+    scale_original = torch.ones(B, 1, device=device)  # [B, 1]
 
     with torch.no_grad():
-        # Compute with original betas (for encoder input)
         smpl_output_original = body_model(
             betas=smpl_betas_original,
             body_pose=smpl_body_pose,
             global_orient=smpl_global_orient,
             transl=smpl_trans,
         )
-        
-        # Compute with augmented betas (for loss target)
-        smpl_output_augmented = body_model(
-            betas=smpl_betas_augmented,
-            body_pose=smpl_body_pose,
-            global_orient=smpl_global_orient,
-            transl=smpl_trans,
-        )
 
-    # Process original beta outputs (for encoder input)
+    # Process original beta outputs (for encoder input, scale=1)
     vertices_original = smpl_output_original.vertices.reshape(B, T, -1, 3)
     joints_original = smpl_output_original.joints[:, :24, :].reshape(B, T, 24, 3)
     height_offset_original = vertices_original[..., 2].min()
@@ -227,22 +204,197 @@ def prepare_motion_batch(
     global_orient_quat_original = quat_from_angle_axis(
         smpl_output_original.global_orient.reshape(B, T, 3)
     )
+
+    return {
+        "betas": betas,
+        "scale": scale_original,
+        "global_orient": global_orient_quat_original,
+        "joints": joints_original,
+        # Keep intermediate data for reuse
+        "_smpl_body_pose": smpl_body_pose,
+        "_smpl_global_orient": smpl_global_orient,
+        "_smpl_trans": smpl_trans,
+        "_B": B,
+        "_T": T,
+    }
+
+
+def apply_beta_augmentation(
+    betas: torch.Tensor,
+    smpl_body_pose: torch.Tensor,
+    smpl_global_orient: torch.Tensor,
+    smpl_trans: torch.Tensor,
+    body_model,
+    beta_augment_std: float = 0.1,
+):
+    """
+    Applies beta augmentation to motion data.
     
-    # Process augmented beta outputs (for loss target)
+    Args:
+        betas: Original betas [B, 10]
+        smpl_body_pose: Body pose [B*T, ...]
+        smpl_global_orient: Global orientation [B*T, 3]
+        smpl_trans: Translation [B*T, 3]
+        body_model: SMPL body model
+        beta_augment_std: Standard deviation for beta augmentation (Gaussian noise)
+    
+    Returns:
+        Dictionary with:
+            - 'betas_augmented': augmented betas [B, 10]
+            - 'vertices': augmented beta's vertices [B, T, V, 3]
+            - 'joints': augmented beta's joints [B, T, 24, 3]
+            - 'global_orient': augmented beta's global_orient [B, T, 3] (axis-angle)
+    """
+    B = betas.shape[0]
+    T = smpl_body_pose.shape[0] // B
+    
+    # Augment betas with Gaussian noise
+    betas_augmented = betas + torch.randn_like(betas) * beta_augment_std
+    smpl_betas_augmented = betas_augmented[:, None, :].expand(-1, T, -1).reshape(B * T, -1)
+
+    with torch.no_grad():
+        smpl_output_augmented = body_model(
+            betas=smpl_betas_augmented,
+            body_pose=smpl_body_pose,
+            global_orient=smpl_global_orient,
+            transl=smpl_trans,
+        )
+
     vertices_augmented = smpl_output_augmented.vertices.reshape(B, T, -1, 3)
     joints_augmented = smpl_output_augmented.joints[:, :24, :].reshape(B, T, 24, 3)
-    height_offset_augmented = vertices_augmented[..., 2].min()
-    joints_augmented[..., 2] -= height_offset_augmented
+    global_orient_augmented = smpl_output_augmented.global_orient.reshape(B, T, 3)
 
-    global_orient_quat_augmented = quat_from_angle_axis(
-        smpl_output_augmented.global_orient.reshape(B, T, 3)
+    return {
+        "betas_augmented": betas_augmented,
+        "vertices": vertices_augmented,
+        "joints": joints_augmented,
+        "global_orient": global_orient_augmented,
+    }
+
+
+def apply_scale_augmentation(
+    vertices: torch.Tensor,
+    joints: torch.Tensor,
+    global_orient: torch.Tensor,
+    scale_augmented: torch.Tensor,
+):
+    """
+    Applies scale augmentation to motion data in root coordinate system.
+    
+    Args:
+        vertices: Vertices [B, T, V, 3]
+        joints: Joints [B, T, 24, 3]
+        global_orient: Global orientation in axis-angle [B, T, 3]
+        scale_augmented: Augmented scale [B, 1]
+    
+    Returns:
+        Dictionary with:
+            - 'joints': scaled joints [B, T, 24, 3]
+            - 'global_orient': global_orient quaternion [B, T, 4] (not affected by scale)
+    """
+    B, T = joints.shape[:2]
+    
+    # Apply scale augmentation in root coordinate system
+    # Root joint is typically the first joint (index 0)
+    root_positions = joints[:, :, 0, :]  # [B, T, 3] - root joint positions
+    
+    # Convert to root coordinate system
+    vertices_local = vertices - root_positions[:, :, None, :]  # [B, T, V, 3]
+    joints_local = joints - root_positions[:, :, None, :]  # [B, T, 24, 3]
+    
+    # Apply scale in root coordinate system
+    scale_augmented_expanded = scale_augmented.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, 1]
+    vertices_local_scaled = vertices_local * scale_augmented_expanded
+    joints_local_scaled = joints_local * scale_augmented_expanded
+    
+    # Convert back to world coordinate system
+    vertices_scaled = vertices_local_scaled + root_positions[:, :, None, :]
+    joints_scaled = joints_local_scaled + root_positions[:, :, None, :]
+    
+    # Adjust height offset to maintain foot-ground contact
+    height_offset = vertices_scaled[..., 2].min()
+    vertices_scaled[..., 2] -= height_offset
+    joints_scaled[..., 2] -= height_offset
+
+    # Global orient is not affected by scale (rotation is scale-invariant)
+    global_orient_quat = quat_from_angle_axis(global_orient)
+
+    return {
+        "joints": joints_scaled,
+        "global_orient": global_orient_quat,
+    }
+
+
+def prepare_motion_batch(
+    batch: dict,
+    body_model,
+    device: torch.device,
+    max_body_joints: int = 22,
+    beta_augment_std: float = 0.1,
+    scale_augment_std: float = 0.1,
+):
+    """
+    Converts raw AMASS data into betas, global orientations (quaternions),
+    and joints suitable for the AutoEncoder. Heavy SMPL computations stay
+    outside the dataset and run here on the chosen device.
+    
+    Now supports beta and scale augmentation:
+    - Encoder input: original beta's global_orient and joints (scale=1)
+    - Decoder modulation: augmented beta + augmented scale
+    - Loss target: augmented beta + augmented scale's global_orient and joints
+    
+    Args:
+        batch: Dictionary containing 'poses', 'trans', 'betas'
+        body_model: SMPL body model
+        device: torch device
+        max_body_joints: Maximum number of body joints to use
+        beta_augment_std: Standard deviation for beta augmentation (Gaussian noise)
+        scale_augment_std: Standard deviation for scale augmentation (Gaussian noise, applied to log scale)
+    
+    Returns:
+        Dictionary with:
+            - 'betas': original betas [B, 10] (for encoder input context, not used directly)
+            - 'betas_augmented': augmented betas [B, 10] (for decoder modulation)
+            - 'scale': original scale [B, 1] (always 1.0, for encoder input context)
+            - 'scale_augmented': augmented scale [B, 1] (for decoder modulation)
+            - 'global_orient': original beta's global_orient [B, T, 4] (for encoder input, scale=1)
+            - 'joints': original beta's joints [B, T, 24, 3] (for encoder input, scale=1)
+            - 'global_orient_target': augmented beta+scale's global_orient [B, T, 4] (for loss)
+            - 'joints_target': augmented beta+scale's joints [B, T, 24, 3] (for loss)
+    """
+    # Prepare original motion
+    original_motion = prepare_original_motion(batch, body_model, device, max_body_joints)
+    
+    # Apply beta augmentation
+    beta_augmented_motion = apply_beta_augmentation(
+        original_motion["betas"],
+        original_motion["_smpl_body_pose"],
+        original_motion["_smpl_global_orient"],
+        original_motion["_smpl_trans"],
+        body_model,
+        beta_augment_std,
+    )
+    
+    # Augment scale: use log-normal distribution to ensure scale > 0
+    # scale_augmented = exp(log(1) + noise) = exp(noise)
+    log_scale_noise = torch.randn(original_motion["_B"], 1, device=device) * scale_augment_std
+    scale_augmented = torch.exp(log_scale_noise)  # [B, 1], always > 0
+    
+    # Apply scale augmentation
+    scale_augmented_motion = apply_scale_augmentation(
+        beta_augmented_motion["vertices"],
+        beta_augmented_motion["joints"],
+        beta_augmented_motion["global_orient"],
+        scale_augmented,
     )
 
     return {
-        "betas": betas,  # Original betas (kept for backward compatibility)
-        "betas_augmented": betas_augmented,  # Augmented betas for decoder modulation
-        "global_orient": global_orient_quat_original,  # Original beta's global_orient (encoder input)
-        "joints": joints_original,  # Original beta's joints (encoder input)
-        "global_orient_target": global_orient_quat_augmented,  # Augmented beta's global_orient (loss target)
-        "joints_target": joints_augmented,  # Augmented beta's joints (loss target)
+        "betas": original_motion["betas"],
+        "betas_augmented": beta_augmented_motion["betas_augmented"],
+        "scale": original_motion["scale"],
+        "scale_augmented": scale_augmented,
+        "global_orient": original_motion["global_orient"],
+        "joints": original_motion["joints"],
+        "global_orient_target": scale_augmented_motion["global_orient"],
+        "joints_target": scale_augmented_motion["joints"],
     }
