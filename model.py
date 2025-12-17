@@ -44,7 +44,9 @@ class AutoEncoder(nn.Module):
         self.num_joints = num_joints
         self.joint_dim = joint_dim
         self.beta_dim = beta_dim
-        self.motion_dim = self.orient_dim + self.num_joints * self.joint_dim
+        # Encoder now only takes joints as input (no global_orient input).
+        # We still predict global_orient as output.
+        self.motion_dim = self.num_joints * self.joint_dim
         self.latent_dim = latent_dim
 
         self.input_proj = nn.Linear(self.motion_dim, latent_dim)
@@ -64,30 +66,24 @@ class AutoEncoder(nn.Module):
             nn.Linear(decoder_input_dim, latent_dim),
             nn.GELU()
         )
-        self.head_orient = nn.Linear(latent_dim, self.orient_dim)
         self.head_joints = nn.Linear(latent_dim, self.num_joints * self.joint_dim)
 
     def forward(
         self,
-        global_orient: torch.Tensor,
         joints: torch.Tensor,
         betas: torch.Tensor,
         scale: torch.Tensor = None,
     ):
         """
         Args:
-            global_orient: [B, T, orient_dim] quaternion rotations.
-            joints: [B, T, num_joints, joint_dim] joint coordinates.
+            joints: [B, T, num_joints, joint_dim] joint coordinates (encoder input).
             betas: [B, beta_dim] or [B, 1, beta_dim] shape embeddings.
             scale: [B, 1] or [B, 1, 1] scale values. If None, defaults to 1.0.
         """
         B, T, _, _ = joints.shape
-        motion = torch.cat(
-            [global_orient, joints.reshape(B, T, self.num_joints * self.joint_dim)],
-            dim=-1,
-        )
+        joints_flat = joints.reshape(B, T, self.num_joints * self.joint_dim)
 
-        x_proj = self.input_proj(motion)
+        x_proj = self.input_proj(joints_flat)
         x_proj = self.pos_embed(x_proj)
 
         seq_len = x_proj.shape[1]
@@ -112,20 +108,12 @@ class AutoEncoder(nn.Module):
         decoder_input = torch.cat([encoded, betas, scale], dim=-1)
         hidden_state = self.decoder_backbone(decoder_input) # [B, T, latent_dim]
 
-        decoded_global_orient = self.head_orient(hidden_state)               # [B, T, orient_dim]
-        decoded_global_orient = F.normalize(
-            decoded_global_orient,
-            p=2,
-            dim=-1,
-            eps=1e-12
-        )
-
         decoded_joints_flat = self.head_joints(hidden_state)                 # [B, T, num_joints*3]
         decoded_joints = decoded_joints_flat.view(
             B, T, self.num_joints, self.joint_dim
         )  # [B, T, num_joints, 3]
 
-        return decoded_global_orient, decoded_joints
+        return decoded_joints
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -150,19 +138,26 @@ if __name__ == "__main__":
     ).to(device)
     
     batch = next(iter(dataloader))
-    motion = prepare_motion_batch(batch, body_model, device, beta_augment_std=0.0, scale_augment_std=0.0)
+    # Disable augmentation for this sanity check:
+    #   - beta_augment_std=0.0      -> no beta noise
+    #   - scale_min=scale_max=1.0   -> fixed scale = 1.0
+    motion = prepare_motion_batch(
+        batch,
+        body_model,
+        device,
+        beta_augment_std=0.0,
+        scale_min=1.0,
+        scale_max=1.0,
+    )
     
     # For testing, use original betas and scale (no augmentation)
     betas = motion["betas"]
     scale = motion["scale"]  # Original scale (1.0)
-    global_orient = motion["global_orient"]
     joints = motion["joints"]
-
+    
     with torch.no_grad():
-        recon_global_orient, recon_joints = model(global_orient, joints, betas, scale)
-
-    print(f"Input global_orient shape: {global_orient.shape}")
+        recon_joints = model(joints, betas, scale)
+    
     print(f"Input joints shape: {joints.shape}")
     print(f"Input betas shape: {betas.shape}")
-    print(f"Reconstructed global_orient shape: {recon_global_orient.shape}")
     print(f"Reconstructed joints shape: {recon_joints.shape}")

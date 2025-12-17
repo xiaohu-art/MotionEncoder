@@ -59,36 +59,26 @@ def train_one_epoch(model, dataloader, body_model, device):
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
     for batch in progress_bar:
         motion = prepare_motion_batch(batch, body_model, device)
-        # Encoder input: original beta's global_orient and joints (scale=1)
-        global_orient = motion["global_orient"]
         joints = motion["joints"]
         # Decoder modulation: augmented beta + augmented scale
         betas_augmented = motion["betas_augmented"]
         scale_augmented = motion["scale_augmented"]
-        # Loss target: augmented beta+scale's global_orient and joints
-        global_orient_target = motion["global_orient_target"]
+        # Loss target: augmented beta+scale's joints
         joints_target = motion["joints_target"]
         
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast('cuda', dtype=torch.float16):
-            # Encoder uses original beta's motion (scale=1), decoder uses augmented beta + scale
-            recon_global_orient, recon_joints = model(global_orient, joints, betas_augmented, scale_augmented)
-            # Loss computed against augmented beta+scale's targets
-            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient_target).mean()
+            recon_joints = model(joints, betas_augmented, scale_augmented)
             joint_loss = F.mse_loss(recon_joints, joints_target)
-            loss = orientation_loss + joint_loss
+            loss = joint_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         total_train_loss += loss.item()
-        progress_bar.set_postfix(
-            loss=loss.item(),
-            orientation_loss=orientation_loss.item(),
-            joint_loss=joint_loss.item()
-        )
+        progress_bar.set_postfix(loss=loss.item(), joint_loss=joint_loss.item())
     return total_train_loss / len(dataloader)
 
 def validate(model, dataloader, body_model, device):
@@ -98,24 +88,18 @@ def validate(model, dataloader, body_model, device):
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
         for batch in progress_bar:
             motion = prepare_motion_batch(batch, body_model, device)
-            # Encoder input: original beta's global_orient and joints (scale=1)
-            global_orient = motion["global_orient"]
             joints = motion["joints"]
             # Decoder modulation: augmented beta + augmented scale
             betas_augmented = motion["betas_augmented"]
             scale_augmented = motion["scale_augmented"]
-            # Loss target: augmented beta+scale's global_orient and joints
-            global_orient_target = motion["global_orient_target"]
+            # Loss target: augmented beta+scale's joints
             joints_target = motion["joints_target"]
 
-            # Encoder uses original beta's motion (scale=1), decoder uses augmented beta + scale
-            recon_global_orient, recon_joints = model(global_orient, joints, betas_augmented, scale_augmented)
-            # Loss computed against augmented beta+scale's targets
-            orientation_loss = quat_error_magnitude(recon_global_orient, global_orient_target).mean()
+            recon_joints = model(joints, betas_augmented, scale_augmented)
             joint_loss = F.mse_loss(recon_joints, joints_target)
-            loss = orientation_loss + joint_loss
+            loss = joint_loss
             total_val_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item(), orientation_loss=orientation_loss.item(), joint_loss=joint_loss.item())
+            progress_bar.set_postfix(loss=loss.item(), joint_loss=joint_loss.item())
             
     return total_val_loss / len(dataloader)
 

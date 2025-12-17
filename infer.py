@@ -49,24 +49,34 @@ def _quat_angle_deg(q1, q2):
     cos = np.clip(cos, 0.0, 1.0)
     return np.degrees(2.0 * np.arccos(cos))
 
-def animate_3d_and_quat(joints_input, joints_recon, quat_input, quat_recon,
+def animate_3d_and_quat(joints_input, joints_recon,
+                        quat_input=None, quat_recon=None,
                         title="", output_file="*.mp4", fps=30):
     """
     Left: 3D keypoints (blue=input, red=recon) with optional orientation triads.
-    Right-top: quaternion components (w,x,y,z) for input (dashed) and recon (solid).
-    Right-bottom: geodesic angle error (degrees).
+    If quaternion inputs are provided:
+      - Right-top: quaternion components (w,x,y,z) for input (dashed) and recon (solid).
+      - Right-bottom: geodesic angle error (degrees).
     """
-    ang_deg     = _quat_angle_deg(quat_input, quat_recon)  # [T]
 
     T = joints_input.shape[0]
-    assert joints_recon.shape[0] == T == quat_input.shape[0] == quat_recon.shape[0]
+    assert joints_recon.shape[0] == T
+
+    has_quat = quat_input is not None and quat_recon is not None
+    if has_quat:
+        assert quat_input.shape[0] == T == quat_recon.shape[0]
+        ang_deg = _quat_angle_deg(quat_input, quat_recon)  # [T]
 
     # --- figure layout ---
-    fig = plt.figure(figsize=(12, 6))
-    gs = fig.add_gridspec(2, 2, width_ratios=[2.0, 1.4], height_ratios=[2.5, 1.0])
-    ax3d   = fig.add_subplot(gs[:, 0], projection='3d')
-    axQuat = fig.add_subplot(gs[0, 1])
-    axErr  = fig.add_subplot(gs[1, 1])
+    if has_quat:
+        fig = plt.figure(figsize=(12, 6))
+        gs = fig.add_gridspec(2, 2, width_ratios=[2.0, 1.4], height_ratios=[2.5, 1.0])
+        ax3d   = fig.add_subplot(gs[:, 0], projection='3d')
+        axQuat = fig.add_subplot(gs[0, 1])
+        axErr  = fig.add_subplot(gs[1, 1])
+    else:
+        fig = plt.figure(figsize=(6, 6))
+        ax3d = fig.add_subplot(111, projection='3d')
 
     # --- 3D scatter (keypoints) ---
     scatter_input = ax3d.scatter([], [], [], c='blue', marker='o', label='Input', s=15)
@@ -88,29 +98,30 @@ def animate_3d_and_quat(joints_input, joints_recon, quat_input, quat_recon,
     ax3d.quiver(0,0,0, 0,1,0, color='g', length=0.12)
     ax3d.quiver(0,0,0, 0,0,1, color='b', length=0.12)
 
-    # --- Quaternion components panel ---
-    t = np.arange(T)
-    labels = ['w','x','y','z']
-    lines_in = []
-    lines_rec = []
-    for i in range(4):
-        (line_in,)  = axQuat.plot(t, quat_input[:, i],  linestyle='--', linewidth=1.2, label=f'{labels[i]} (in)')
-        (line_rec,) = axQuat.plot(t, quat_recon[:, i],  linestyle='-',  linewidth=1.5, label=f'{labels[i]} (rec)')
-        lines_in.append(line_in); lines_rec.append(line_rec)
-    cursor_quat = axQuat.axvline(0, color='k', linewidth=1)
-    axQuat.set_xlim(0, T-1)
-    axQuat.set_ylim(-1.05, 1.05)
-    axQuat.set_title('Root rotation quaternion (components)')
-    axQuat.set_xlabel('Frame'); axQuat.set_ylabel('value')
-    axQuat.legend(ncol=2, fontsize=8)
+    if has_quat:
+        # --- Quaternion components panel ---
+        t = np.arange(T)
+        labels = ['w','x','y','z']
+        lines_in = []
+        lines_rec = []
+        for i in range(4):
+            (line_in,)  = axQuat.plot(t, quat_input[:, i],  linestyle='--', linewidth=1.2, label=f'{labels[i]} (in)')
+            (line_rec,) = axQuat.plot(t, quat_recon[:, i],  linestyle='-',  linewidth=1.5, label=f'{labels[i]} (rec)')
+            lines_in.append(line_in); lines_rec.append(line_rec)
+        cursor_quat = axQuat.axvline(0, color='k', linewidth=1)
+        axQuat.set_xlim(0, T-1)
+        axQuat.set_ylim(-1.05, 1.05)
+        axQuat.set_title('Root rotation quaternion (components)')
+        axQuat.set_xlabel('Frame'); axQuat.set_ylabel('value')
+        axQuat.legend(ncol=2, fontsize=8)
 
-    # --- Angle error panel ---
-    (line_err,) = axErr.plot(t, ang_deg)
-    cursor_err = axErr.axvline(0, color='k', linewidth=1)
-    axErr.set_xlim(0, T-1)
-    axErr.set_ylim(0.0, max(1.0, np.nanmax(ang_deg) * 1.1))
-    axErr.set_title('Geodesic angle error (deg)')
-    axErr.set_xlabel('Frame'); axErr.set_ylabel('deg')
+        # --- Angle error panel ---
+        (line_err,) = axErr.plot(t, ang_deg)
+        cursor_err = axErr.axvline(0, color='k', linewidth=1)
+        axErr.set_xlim(0, T-1)
+        axErr.set_ylim(0.0, max(1.0, np.nanmax(ang_deg) * 1.1))
+        axErr.set_title('Geodesic angle error (deg)')
+        axErr.set_xlabel('Frame'); axErr.set_ylabel('deg')
 
     # --- update function ---
     def update(f):
@@ -120,10 +131,13 @@ def animate_3d_and_quat(joints_input, joints_recon, quat_input, quat_recon,
         scatter_input._offsets3d = (p_in[:,0],  p_in[:,1],  p_in[:,2])
         scatter_recon._offsets3d = (p_rec[:,0], p_rec[:,1], p_rec[:,2])
         ax3d.set_title(f"{title} - Frame {f}")
-        # move the cursors
-        cursor_quat.set_xdata([f, f])
-        cursor_err.set_xdata([f, f])
-        return (scatter_input, scatter_recon, cursor_quat, cursor_err)
+        if has_quat:
+            # move the cursors
+            cursor_quat.set_xdata([f, f])
+            cursor_err.set_xdata([f, f])
+            return (scatter_input, scatter_recon, cursor_quat, cursor_err)
+        else:
+            return (scatter_input, scatter_recon)
 
     interval = int(1000 / fps)
     ani = animation.FuncAnimation(fig, update, frames=T, interval=interval, blit=False)
@@ -186,62 +200,57 @@ if __name__ == "__main__":
         "trans": trans,
         "betas": betas,
     }
-    # Disable beta and scale augmentation during inference (set std=0)
-    motion = prepare_motion_batch(batched_sample, body_model, device, beta_augment_std=0.0, scale_augment_std=0.0)
+    # Disable beta and scale augmentation during inference:
+    #   - beta_augment_std=0.0  -> no beta noise
+    #   - scale_min=scale_max=1.0 -> fixed scale = 1.0
+    motion = prepare_motion_batch(
+        batched_sample,
+        body_model,
+        device,
+        beta_augment_std=0.0,
+        scale_min=1.0,
+        scale_max=1.0,
+    )
 
-    # For inference, use original betas and scale (no augmentation)
+    # For inference, use original betas, scale, and joints (no augmentation)
     betas_seq = motion["betas"]
     scale_seq = motion["scale"]  # Original scale (1.0)
-    global_orient_seq = motion["global_orient"]
     joints_seq = motion["joints"]
 
     B, T, _, _ = joints_seq.shape
     assert B == 1, "Inference currently supports batch size 1."
 
-    context_orient = deque(maxlen=args.seq_len)
     context_joints = deque(maxlen=args.seq_len)
 
-    recon_quats = []
     recon_joints = []
-    input_quats = []
     input_joints = []
 
     print("Streaming through the trajectory...")
     for t in tqdm(range(T), desc="Streaming Inference"):
-        orient_t = global_orient_seq[0, t]
         joints_t = joints_seq[0, t]
-        input_quats.append(orient_t.detach().cpu())
         input_joints.append(joints_t.detach().cpu())
 
-        context_orient.append(orient_t)
         context_joints.append(joints_t)
 
-        if len(context_orient) < args.seq_len:
-            recon_quats.append(orient_t.detach().cpu())
+        if len(context_joints) < args.seq_len:
             recon_joints.append(joints_t.detach().cpu())
             continue
 
-        orient_tensor = torch.stack(list(context_orient), dim=0).unsqueeze(0)
         joints_tensor = torch.stack(list(context_joints), dim=0).unsqueeze(0)
 
         with torch.no_grad():
-            recon_orient_seq, recon_joints_seq = model(
-                orient_tensor, joints_tensor, betas_seq, scale_seq
+            recon_joints_seq = model(
+                joints_tensor, betas_seq, scale_seq
             )
-        recon_quats.append(recon_orient_seq[:, -1].squeeze(0).detach().cpu())
         recon_joints.append(recon_joints_seq[:, -1].squeeze(0).detach().cpu())
 
-    input_quats_np = torch.stack(input_quats, dim=0).numpy()
     input_joints_np = torch.stack(input_joints, dim=0).numpy()
-    recon_quats_np = torch.stack(recon_quats, dim=0).numpy()
     recon_joints_np = torch.stack(recon_joints, dim=0).numpy()
 
     print("Starting animation... Close the plot window to exit.")
     animate_3d_and_quat(
         input_joints_np,
         recon_joints_np,
-        input_quats_np,
-        recon_quats_np,
         title=traj_key,
         output_file=output_video,
         fps=args.fps,
