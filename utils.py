@@ -216,6 +216,7 @@ def prepare_original_motion(
 def apply_beta_augmentation(
     betas: torch.Tensor,
     smpl_body_pose: torch.Tensor,
+    smpl_global_orient: torch.Tensor,
     smpl_trans: torch.Tensor,
     body_model,
     beta_augment_std: float = 0.1,
@@ -226,6 +227,7 @@ def apply_beta_augmentation(
     Args:
         betas: Original betas [B, 10]
         smpl_body_pose: Body pose [B*T, ...]
+        smpl_global_orient: Global orientation [B*T, 3]
         smpl_trans: Translation [B*T, 3]
         body_model: SMPL body model
         beta_augment_std: Standard deviation for beta augmentation (Gaussian noise)
@@ -247,6 +249,7 @@ def apply_beta_augmentation(
         smpl_output_augmented = body_model(
             betas=smpl_betas_augmented,
             body_pose=smpl_body_pose,
+            global_orient=smpl_global_orient,
             transl=smpl_trans,
         )
 
@@ -350,6 +353,7 @@ def prepare_motion_batch(
     beta_augmented_motion = apply_beta_augmentation(
         original_motion["betas"],
         original_motion["_smpl_body_pose"],
+        original_motion["_smpl_global_orient"],
         original_motion["_smpl_trans"],
         body_model,
         beta_augment_std,

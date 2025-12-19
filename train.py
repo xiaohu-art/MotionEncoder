@@ -37,6 +37,9 @@ def parse_args():
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--num-workers", type=int, default=32)
     p.add_argument("--seed", type=int, default=42)
+    # loss weights
+    p.add_argument("--continuity-weight", type=float, default=0.1,
+                   help="weight for inter-frame continuity loss on joints velocities")
     # scheduler
     p.add_argument("--t-max", type=int, default=20, help="CosineAnnealingLR T_max, same as epochs")
     p.add_argument("--eta-min", type=float, default=1e-6, help="CosineAnnealingLR eta_min")
@@ -52,7 +55,7 @@ def get_device(device_arg):
 
 scaler = torch.amp.GradScaler('cuda')
 
-def train_one_epoch(model, dataloader, body_model, device):
+def train_one_epoch(model, dataloader, body_model, device, continuity_weight: float):
     model.train()
     total_train_loss = 0.0
     
@@ -71,17 +74,31 @@ def train_one_epoch(model, dataloader, body_model, device):
         with torch.amp.autocast('cuda', dtype=torch.float16):
             recon_joints = model(joints, betas_augmented, scale_augmented)
             joint_loss = F.mse_loss(recon_joints, joints_target)
-            loss = joint_loss
+
+            # Inter-frame continuity loss on joint velocities
+            if continuity_weight > 0.0 and recon_joints.shape[1] > 1:
+                # [B, T-1, J, 3]
+                recon_vel = torch.diff(recon_joints, dim=1)
+                target_vel = torch.diff(joints_target, dim=1)
+                continuity_loss = F.mse_loss(recon_vel, target_vel)
+                loss = joint_loss + continuity_weight * continuity_loss
+            else:
+                continuity_loss = torch.tensor(0.0, device=device, dtype=joint_loss.dtype)
+                loss = joint_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
         total_train_loss += loss.item()
-        progress_bar.set_postfix(loss=loss.item(), joint_loss=joint_loss.item())
+        progress_bar.set_postfix(
+            loss=loss.item(),
+            joint_loss=joint_loss.item(),
+            continuity_loss=continuity_loss.item(),
+        )
     return total_train_loss / len(dataloader)
 
-def validate(model, dataloader, body_model, device):
+def validate(model, dataloader, body_model, device, continuity_weight: float):
     model.eval()
     total_val_loss = 0.0
     with torch.no_grad():
@@ -97,9 +114,21 @@ def validate(model, dataloader, body_model, device):
 
             recon_joints = model(joints, betas_augmented, scale_augmented)
             joint_loss = F.mse_loss(recon_joints, joints_target)
-            loss = joint_loss
+
+            if continuity_weight > 0.0 and recon_joints.shape[1] > 1:
+                recon_vel = torch.diff(recon_joints, dim=1)
+                target_vel = torch.diff(joints_target, dim=1)
+                continuity_loss = F.mse_loss(recon_vel, target_vel)
+                loss = joint_loss + continuity_weight * continuity_loss
+            else:
+                continuity_loss = torch.tensor(0.0, device=device, dtype=joint_loss.dtype)
+                loss = joint_loss
             total_val_loss += loss.item()
-            progress_bar.set_postfix(loss=loss.item(), joint_loss=joint_loss.item())
+            progress_bar.set_postfix(
+                loss=loss.item(),
+                joint_loss=joint_loss.item(),
+                continuity_loss=continuity_loss.item(),
+            )
             
     return total_val_loss / len(dataloader)
 
@@ -185,8 +214,12 @@ if __name__ == "__main__":
     global_step = 0
 
     for epoch in range(args.epochs):
-        avg_train_loss = train_one_epoch(model, train_dataloader, body_model, device)
-        avg_val_loss = validate(model, val_dataloader, body_model, device)
+        avg_train_loss = train_one_epoch(
+            model, train_dataloader, body_model, device, args.continuity_weight
+        )
+        avg_val_loss = validate(
+            model, val_dataloader, body_model, device, args.continuity_weight
+        )
         
         print(f"Epoch [{epoch+1}/{args.epochs}] | Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
         

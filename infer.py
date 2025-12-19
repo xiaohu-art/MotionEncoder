@@ -232,10 +232,6 @@ if __name__ == "__main__":
 
         context_joints.append(joints_t)
 
-        if len(context_joints) < args.seq_len:
-            recon_joints.append(joints_t.detach().cpu())
-            continue
-
         joints_tensor = torch.stack(list(context_joints), dim=0).unsqueeze(0)
 
         with torch.no_grad():
