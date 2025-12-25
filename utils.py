@@ -197,8 +197,15 @@ def prepare_original_motion(
     # Process original beta outputs (for encoder input, scale=1)
     vertices_original = smpl_output_original.vertices.reshape(B, T, -1, 3)
     joints_original = smpl_output_original.joints[:, :24, :].reshape(B, T, 24, 3)
-    height_offset_original = vertices_original[..., 2].min()
-    joints_original[..., 2] -= height_offset_original
+
+    # --- ground alignment (unified & per-sample) ---
+    # Compute ground height per sample (B) using the lowest vertex over (T, V).
+    # vertices_original[..., 2]: [B, T, V]
+    ground_z = vertices_original[..., 2].amin(dim=(1, 2), keepdim=True)  # [B, 1, 1]
+    vertices_original = vertices_original.clone()
+    joints_original = joints_original.clone()
+    vertices_original[..., 2] -= ground_z
+    joints_original[..., 2] -= ground_z
 
     return {
         "betas": betas,
@@ -299,10 +306,13 @@ def apply_scale_augmentation(
     vertices_scaled = vertices_local_scaled + root_positions[:, :, None, :]
     joints_scaled = joints_local_scaled + root_positions[:, :, None, :]
     
-    # Adjust height offset to maintain foot-ground contact
-    height_offset = vertices_scaled[..., 2].min()
-    vertices_scaled[..., 2] -= height_offset
-    joints_scaled[..., 2] -= height_offset
+    # --- ground alignment (unified & per-sample) ---
+    # Use the lowest vertex over (T, V) as the ground height for each sample.
+    ground_z = vertices_scaled[..., 2].amin(dim=(1, 2), keepdim=True)  # [B, 1, 1]
+    vertices_scaled = vertices_scaled.clone()
+    joints_scaled = joints_scaled.clone()
+    vertices_scaled[..., 2] -= ground_z
+    joints_scaled[..., 2] -= ground_z
 
     return {
         "joints": joints_scaled,
@@ -314,7 +324,7 @@ def prepare_motion_batch(
     body_model,
     device: torch.device,
     max_body_joints: int = 22,
-    beta_augment_std: float = 0.1,
+    beta_augment_std: float = 1.0,
     scale_min: float = 0.6,
     scale_max: float = 1.2,
 ):

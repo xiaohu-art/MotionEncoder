@@ -207,15 +207,18 @@ if __name__ == "__main__":
         batched_sample,
         body_model,
         device,
-        beta_augment_std=0.0,
-        scale_min=1.0,
-        scale_max=1.0,
+        beta_augment_std=1.0,
+        scale_min=0.75,
+        scale_max=0.75,
     )
 
     # For inference, use original betas, scale, and joints (no augmentation)
     betas_seq = motion["betas"]
     scale_seq = motion["scale"]  # Original scale (1.0)
     joints_seq = motion["joints"]
+
+    betas_seq_augmented = motion["betas_augmented"]
+    scale_seq_augmented = motion["scale_augmented"]
 
     B, T, _, _ = joints_seq.shape
     assert B == 1, "Inference currently supports batch size 1."
@@ -236,7 +239,7 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             recon_joints_seq = model(
-                joints_tensor, betas_seq, scale_seq
+                joints_tensor, betas_seq_augmented, scale_seq_augmented
             )
         recon_joints.append(recon_joints_seq[:, -1].squeeze(0).detach().cpu())
 
